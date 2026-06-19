@@ -63,7 +63,7 @@ jobs:
 
       - name: Pull models
         run: |
-          ollama pull qwen3.5:4b
+          ollama pull nemotron:3b    # Try "nemotron:3b" or "nemotron-3-nano:4b"
           ollama pull nomic-embed-text
 
       - name: Start API server + Cloudflare tunnel
