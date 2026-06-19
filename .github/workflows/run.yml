@@ -63,7 +63,7 @@ jobs:
 
       - name: Pull models
         run: |
-          ollama pull deepseek-r1:1.5b-qwen-distill-q4_K_M
+          ollama pull deepseek-coder:1.3b-instruct-q4_K_M
           ollama pull nomic-embed-text
 
       - name: Start API server + Cloudflare tunnel
