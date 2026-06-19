@@ -1,0 +1,133 @@
+name: Run Server & Update Chat Config
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 320
+
+    steps:
+      - name: Clone private backend
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/backend
+          token: ${{ secrets.BACKEND_PAT }}
+          path: backend
+
+      - name: Move code to root
+        run: |
+          cp -r backend/* .
+          rm -rf backend
+
+      - name: Cache Rust binary
+        uses: actions/cache@v4
+        id: binary-cache
+        with:
+          path: target/release/unified-api
+          key: rust-binary-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'src/**') }}
+          restore-keys: rust-binary-${{ runner.os }}-
+
+      - name: Cache Ollama models
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-models-${{ hashFiles('.github/workflows/run.yml') }}
+          restore-keys: ollama-models-
+
+      - name: Cache cloudflared
+        uses: actions/cache@v4
+        id: cloudflared-cache
+        with:
+          path: ./cloudflared
+          key: cloudflared-${{ runner.os }}-v1
+
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Build server (if cache miss)
+        if: steps.binary-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo build --release
+          cp target/release/unified-api ./
+
+      - name: Setup Ollama
+        uses: ai-action/setup-ollama@v2
+
+      - name: Pull models
+        run: |
+          ollama pull llama3.2:1b
+          ollama pull nomic-embed-text
+
+      - name: Start API server + Cloudflare tunnel
+        run: |
+          if [ -f target/release/unified-api ] && [ ! -f ./unified-api ]; then
+            cp target/release/unified-api ./
+          fi
+          chmod +x ./unified-api
+          ./unified-api &
+          echo "Waiting for server to start..."
+          for i in {1..10}; do
+            if curl -s http://localhost:8000/health | grep -q '"status":"ok"'; then
+              echo "Server is healthy"
+              break
+            fi
+            sleep 2
+          done
+
+          if ! curl -s http://localhost:8000/health | grep -q '"status":"ok"'; then
+            echo "Server failed to start"
+            exit 1
+          fi
+
+          if [ ! -f ./cloudflared ]; then
+            curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+            chmod +x cloudflared
+          fi
+
+          ./cloudflared tunnel --url http://localhost:8000 2>&1 | tee tunnel.log &
+
+          echo "Waiting for tunnel URL..."
+          for i in {1..30}; do
+            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            if [ -n "$TUNNEL_URL" ]; then
+              break
+            fi
+            sleep 1
+          done
+
+          echo "::notice::Tunnel URL: ${TUNNEL_URL}"
+
+          # --- Update config.js in the chat repo ---
+          CHAT_REPO="${{ github.repository_owner }}/chat"
+          NEW_CONFIG="const API_URL = \"${TUNNEL_URL}\";"
+          ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
+
+          FILE_INFO=$(curl -s -H "Authorization: Bearer ${{ secrets.BACKEND_PAT }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${CHAT_REPO}/contents/config.js")
+          SHA=$(echo "$FILE_INFO" | jq -r '.sha')
+
+          if [ "$SHA" != "null" ]; then
+            curl -s -X PUT \
+              -H "Authorization: Bearer ${{ secrets.BACKEND_PAT }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${CHAT_REPO}/contents/config.js" \
+              -d "{\"message\":\"update API URL\",\"content\":\"${ENCODED}\",\"sha\":\"${SHA}\"}"
+          else
+            curl -s -X PUT \
+              -H "Authorization: Bearer ${{ secrets.BACKEND_PAT }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${CHAT_REPO}/contents/config.js" \
+              -d "{\"message\":\"add API URL\",\"content\":\"${ENCODED}\"}"
+          fi
+
+          echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
+          sleep infinity
