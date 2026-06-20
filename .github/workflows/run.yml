@@ -63,7 +63,7 @@ jobs:
 
       - name: Pull models
         run: |
-          ollama pull Phi-4-mini-flash-reasoning
+          ollama pull phi4-mini-reasoning:flash
           ollama pull nomic-embed-text
 
       - name: Start API server + Cloudflare tunnel
