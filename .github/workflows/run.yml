@@ -63,7 +63,7 @@ jobs:
 
       - name: Pull models
         run: |
-          ollama pull ollama pull gemma3:1b
+          ollama pull gemma3:1b
           ollama pull qwen3-embedding:0.6b
 
       - name: Start API server + Cloudflare tunnel
