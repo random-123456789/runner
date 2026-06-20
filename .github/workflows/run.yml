@@ -64,7 +64,7 @@ jobs:
       - name: Pull models
         run: |
           ollama pull phi4-mini-reasoning
-          ollama pull nomic-embed-text
+          ollama pull qwen3-embedding:0.6b
 
       - name: Start API server + Cloudflare tunnel
         run: |
