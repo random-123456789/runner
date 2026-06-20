@@ -63,7 +63,7 @@ jobs:
 
       - name: Pull models
         run: |
-          ollama pull gemma3:1b
+          ollama pull deepseek-r1:1.5b
           ollama pull nomic-embed-text
 
       - name: Start API server + Cloudflare tunnel
