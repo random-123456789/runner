@@ -3,12 +3,13 @@ name: Run Server & Update Chat Config
 on:
   workflow_dispatch:
   schedule:
-    - cron: '3 * * * *'
+    - cron: '*/3 * * * *'
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 5
+    
     steps:
       - name: Clone private backend
         uses: actions/checkout@v4
@@ -130,4 +131,4 @@ jobs:
 
           echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
 
-          sleep 3m
+          sleep infinity
