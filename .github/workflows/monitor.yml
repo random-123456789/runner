@@ -1,0 +1,64 @@
+name: Monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check health and trigger replacement if needed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BACKEND_PAT: ${{ secrets.BACKEND_PAT }}
+        run: |
+          set -e
+
+          # 1. Get the current tunnel URL from config.js in the chat repo
+          CHAT_REPO="${{ github.repository_owner }}/chat"
+          FILE_INFO=$(curl -s -H "Authorization: Bearer ${BACKEND_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${CHAT_REPO}/contents/config.js")
+          TUNNEL_URL=$(echo "$FILE_INFO" | jq -r '.content' | base64 -d | grep -oP "https://[a-zA-Z0-9-]+\.trycloudflare\.com")
+
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "No tunnel URL found in config.js – triggering a new server."
+            trigger_server
+            exit 0
+          fi
+
+          # 2. Check if the service is reachable (health endpoint)
+          if ! curl -s --max-time 10 "${TUNNEL_URL}/health" | grep -q '"status":"ok"'; then
+            echo "Service is unreachable – triggering a new server."
+            trigger_server
+            exit 0
+          fi
+
+          # 3. Check how long the server has been running (from .server_start file in the runner repo)
+          # We need to clone the runner repo to read the file
+          git clone --depth 1 https://github.com/${{ github.repository }} repo
+          cd repo
+          if [ -f .server_start ]; then
+            START_TIME=$(cat .server_start)
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$(( CURRENT_TIME - START_TIME ))
+            # If the server has been running for more than 5.5 hours (19800 seconds), trigger a new run
+            if [ $ELAPSED -gt 19800 ]; then
+              echo "Server has been running for ${ELAPSED} seconds – triggering a new run to avoid timeout."
+              trigger_server
+            fi
+          else
+            echo "No .server_start file – server may not be running. Triggering a new run."
+            trigger_server
+          fi
+
+      - name: Trigger server workflow
+        id: trigger
+        run: |
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/server.yml/dispatches" \
+            -d '{"ref":"${{ github.ref }}"}'
