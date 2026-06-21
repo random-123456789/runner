@@ -3,7 +3,7 @@ name: Server (24/7 via Cron Overlap)
 on:
   workflow_dispatch:          # manual trigger for testing
   schedule:
-    - cron: '0 */5 * * *'     # every 5 hours at minute 0
+    - cron: '*/2 * * * *'     # every 5 hours at minute 0
 
 permissions:
   contents: read              # no write permissions needed (we don't commit anything)
