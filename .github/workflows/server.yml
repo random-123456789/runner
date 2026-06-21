@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # needed only if we keep this; the PAT already has it
+  contents: write   # needed to commit .server_start
 
 jobs:
   run:
@@ -12,58 +12,84 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - uses: actions/checkout@v4
+      # --- Check out the RUNNER repo (this is where the workflow lives) ---
+      - name: Checkout runner repo
+        uses: actions/checkout@v4
+        with:
+          # The default is the current repo – no repository parameter needed
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # --- Check out the BACKEND repo into a subdirectory ---
+      - name: Checkout backend repo
+        uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/backend
-          token: ${{ secrets.TOKEN }}
+          token: ${{ secrets.TOKEN }}          # use your PAT
           path: backend
 
-      - run: cp -r backend/* . && rm -rf backend
-
-      - uses: actions/cache@v4
+      # --- Caches (they now look for files inside backend/) ---
+      - name: Cache Rust binary
+        uses: actions/cache@v4
         id: binary-cache
         with:
-          path: target/release/unified-api
-          key: rust-binary-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'src/**') }}
+          path: backend/target/release/unified-api
+          key: rust-binary-${{ runner.os }}-${{ hashFiles('backend/Cargo.toml', 'backend/src/**') }}
           restore-keys: rust-binary-${{ runner.os }}-
 
-      - uses: actions/cache@v4
+      - name: Cache Ollama models
+        uses: actions/cache@v4
         with:
           path: ~/.ollama/models
           key: ollama-models-${{ hashFiles('.github/workflows/server.yml') }}
           restore-keys: ollama-models-
 
-      - uses: actions/cache@v4
+      - name: Cache cloudflared
+        uses: actions/cache@v4
         id: cloudflared-cache
         with:
-          path: ./cloudflared
+          path: ./cloudflared          # this stays in the root
           key: cloudflared-${{ runner.os }}-v1
 
-      - uses: actions-rs/toolchain@v1
+      # --- Rust & build (inside backend/) ---
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
         with:
           profile: minimal
           toolchain: stable
           override: true
 
-      - run: cargo build --release && cp target/release/unified-api ./
+      - name: Build server (if cache miss)
         if: steps.binary-cache.outputs.cache-hit != 'true'
+        run: |
+          cd backend
+          cargo build --release
+          cp target/release/unified-api ./
+        # This copies unified-api to backend/ for easy access
 
-      - uses: ai-action/setup-ollama@v2
-      - run: |
+      # --- Ollama setup ---
+      - name: Setup Ollama
+        uses: ai-action/setup-ollama@v2
+
+      - name: Pull models
+        run: |
           ollama pull gemma3:1b
           ollama pull qwen3-embedding:0.6b
 
-      - name: Start services
+      # --- Start server, tunnel, update config, and write timestamp ---
+      - name: Start services and write timestamp
         env:
-          GH_TOKEN: ${{ secrets.TOKEN }}   # using TOKEN for all API calls
+          GH_TOKEN: ${{ secrets.TOKEN }}
         run: |
           set -e
 
-          # Start server
+          cd backend
+
+          # Start the server
           chmod +x ./unified-api
           pkill -f unified-api 2>/dev/null || true
           ./unified-api &
 
+          # Wait for health
           for i in {1..10}; do
             if curl -s http://localhost:8000/health | grep -q '"status":"ok"'; then
               echo "Server ready"
@@ -73,13 +99,13 @@ jobs:
           done
           curl -s http://localhost:8000/health | grep -q '"status":"ok"' || { echo "Server failed"; exit 1; }
 
-          # Start tunnel
-          if [ ! -f ./cloudflared ]; then
-            curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
-            chmod +x cloudflared
+          # Start Cloudflare tunnel (cloudflared binary is in root, so we need to reference it)
+          if [ ! -f ../cloudflared ]; then
+            curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o ../cloudflared
+            chmod +x ../cloudflared
           fi
           pkill -f cloudflared 2>/dev/null || true
-          ./cloudflared tunnel --protocol http2 --url http://localhost:8000 2>&1 | tee tunnel.log &
+          ../cloudflared tunnel --protocol http2 --url http://localhost:8000 2>&1 | tee tunnel.log &
 
           # Get tunnel URL
           for i in {1..30}; do
@@ -89,7 +115,7 @@ jobs:
           done
           echo "::notice::Tunnel URL: ${TUNNEL_URL}"
 
-          # Update config.js
+          # Update config.js in chat repo (using TOKEN)
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG="const API_URL = \"${TUNNEL_URL}\";"
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
@@ -114,7 +140,10 @@ jobs:
           fi
           echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
 
-          # Write a timestamp to the repo
+          # Go back to the root of the runner repo to commit the timestamp
+          cd ..
+
+          # Write timestamp to the runner repo
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           echo "$(date +%s)" > .server_start
