@@ -8,7 +8,6 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
     
     steps:
       - name: Clone private backend
@@ -131,4 +130,4 @@ jobs:
 
           echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
 
-          sleep infinity
+          sleep 5m
