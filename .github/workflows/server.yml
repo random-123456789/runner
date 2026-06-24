@@ -82,17 +82,20 @@ jobs:
           GH_TOKEN: ${{ secrets.TOKEN }}
         run: |
           cd backend
-          ./backend &
+          ./backend 
+          
           for i in {1..10}; do
             curl -s http://localhost:8000/health | grep -q '"status":"ok"' && break
             sleep 2
           done
+          
           curl -s --fail http://localhost:8000/health | grep -q '"status":"ok"' || exit 1
 
           if [ ! -f ../cloudflared ]; then
             curl -Lo ../cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x ../cloudflared
           fi
+          
           pkill -f cloudflared 2>/dev/null || true
           ../cloudflared tunnel --protocol http2 --url http://localhost:8000 2>&1 | tee tunnel.log &
 
@@ -101,6 +104,7 @@ jobs:
             [ -n "$TUNNEL_URL" ] && break
             sleep 1
           done
+          
           echo "::notice::Tunnel URL: ${TUNNEL_URL}"
 
           CHAT_REPO="${{ github.repository_owner }}/chat"
@@ -152,6 +156,7 @@ jobs:
           START_TIME=$(date +%s)
           TRIGGER_AT=$((350 * 60))
           TRIGGERED=false
+          
           while true; do
             ELAPSED=$(( $(date +%s) - START_TIME ))
             if [ $ELAPSED -ge $TRIGGER_AT ] && [ "$TRIGGERED" = "false" ]; then
@@ -161,10 +166,12 @@ jobs:
                 -d '{"ref":"${{ github.ref }}"}'
               TRIGGERED=true
             fi
+            
             if ! curl -s http://localhost:8000/health | grep -q '"status":"ok"'; then
               pkill -f backend 2>/dev/null || true
               ./backend &
             fi
+            
             if ! pgrep -f cloudflared > /dev/null; then
               ../cloudflared tunnel --protocol http2 --url http://localhost:8000 2>&1 | tee -a tunnel.log &
             fi
