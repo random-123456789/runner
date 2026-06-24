@@ -50,15 +50,13 @@ jobs:
           cargo build --release
           cp target/release/backend ./backend
           chmod +x ./backend
+          rm -rf backend/target
 
       - if: steps.binary.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: backend/backend
           key: backend-v1
-
-      - name: Clean build
-        run: rm -rf backend/target
 
       - uses: ai-action/setup-ollama@v2
       - run: ollama pull ibm/granite4:3b-h
@@ -112,40 +110,34 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
           SHA=$(echo "$FILE_INFO" | jq -r '.sha')
+
           if [ "$SHA" != "null" ]; then
-            curl -s -X PUT -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
-              -d "{
-                \"message\":\"update API URL\",
-                \"content\":\"${ENCODED}\",
-                \"sha\":\"${SHA}\",
-                \"author\":{
-                  \"name\":\"github-actions[bot]\",
-                  \"email\":\"github-actions[bot]@users.noreply.github.com\"
-                },
-                \"committer\":{
-                  \"name\":\"github-actions[bot]\",
-                  \"email\":\"github-actions[bot]@users.noreply.github.com\"
-                }
-              }"
+            MESSAGE="update API URL"
           else
-            curl -s -X PUT -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
-              -d "{
-                \"message\":\"add API URL\",
-                \"content\":\"${ENCODED}\",
-                \"author\":{
-                  \"name\":\"github-actions[bot]\",
-                  \"email\":\"github-actions[bot]@users.noreply.github.com\"
-                },
-                \"committer\":{
-                  \"name\":\"github-actions[bot]\",
-                  \"email\":\"github-actions[bot]@users.noreply.github.com\"
-                }
-              }"
+            MESSAGE="add API URL"
           fi
+
+          PAYLOAD=$(jq -n \
+            --arg message "$MESSAGE" \
+            --arg content "$ENCODED" \
+            --arg sha "$SHA" \
+            --arg authorName "github-actions[bot]" \
+            --arg authorEmail "github-actions[bot]@users.noreply.github.com" \
+            '{
+              message: $message,
+              content: $content,
+              (if $sha != "null" then {sha: $sha} else {} end) +
+              {
+                author: {name: $authorName, email: $authorEmail},
+                committer: {name: $authorName, email: $authorEmail}
+              }
+            }')
+
+          curl -s -X PUT -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
+            -d "$PAYLOAD"
+
           echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
 
           START_TIME=$(date +%s)
