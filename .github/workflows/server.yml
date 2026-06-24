@@ -78,8 +78,6 @@ jobs:
           key: cloudflared
 
       - name: Run and Replicate
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
         run: |
           cd backend
           ./backend &
