@@ -3,13 +3,12 @@ name: Server
 on:
   workflow_dispatch:
 
-permissions:
-  actions: write
+  schedule:
+    - cron: '*/5 * * * *'
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
 
     steps:
       - uses: actions/checkout@v4
@@ -137,28 +136,3 @@ jobs:
             -d "$PAYLOAD"
           
           echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
-          
-          START_TIME=$(date +%s)
-          TRIGGER_AT=$((350 * 60))
-          TRIGGERED=false
-          
-          while true; do
-            ELAPSED=$(( $(date +%s) - START_TIME ))
-            if [ $ELAPSED -ge $TRIGGER_AT ] && [ "$TRIGGERED" = "false" ]; then
-              curl -X POST -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
-                -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/server.yml/dispatches" \
-                -d '{"ref":"${{ github.ref }}"}'
-              TRIGGERED=true
-            fi
-            
-            if ! curl -s http://localhost:8000/health | grep -q '"status":"ok"'; then
-              pkill -f backend 2>/dev/null || true
-              ./backend &
-            fi
-            
-            if ! pgrep -f cloudflared > /dev/null; then
-              ../cloudflared tunnel --protocol http2 --url http://localhost:8000 2>&1 | tee -a tunnel.log &
-            fi
-            sleep 30
-          done
