@@ -136,3 +136,5 @@ jobs:
             -d "$PAYLOAD"
           
           echo "::notice::Frontend URL: https://${{ github.repository_owner }}.github.io/chat/"
+
+          sleep 360m
