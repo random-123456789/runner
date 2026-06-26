@@ -12,27 +12,14 @@ jobs:
     timeout-minutes: 360
 
     steps:
-    
+      
+      # Backend Setup    
       - uses: actions/cache@v4
         id: binary
         with:
           path: backend/backend
           key: backend-v1
           restore-keys: backend-
-
-      - uses: actions/cache@v4
-        id: ollama
-        with:
-          path: ~/.ollama/models
-          key: ollama-granite4-v1
-          restore-keys: ollama-
-
-      - uses: actions/cache@v4
-        id: cloudflared
-        with:
-          path: ./cloudflared
-          key: cloudflared-v1
-          restore-keys: cloudflared-
 
       - if: steps.binary.outputs.cache-hit != 'true'
         uses: actions/checkout@v4
@@ -62,6 +49,14 @@ jobs:
           path: backend/backend
           key: backend-v1
 
+      # Ollama Setup
+      - uses: actions/cache@v4
+        id: ollama
+        with:
+          path: ~/.ollama/models
+          key: ollama-granite4-v1
+          restore-keys: ollama-
+          
       - if: steps.ollama.outputs.cache-hit != 'true'
         uses: ai-action/setup-ollama@v2
 
@@ -73,6 +68,14 @@ jobs:
         with:
           path: ~/.ollama/models
           key: ollama-granite4-v1
+
+      # Cloudflare Setup
+      - uses: actions/cache@v4
+        id: cloudflared
+        with:
+          path: ./cloudflared
+          key: cloudflared-v1
+          restore-keys: cloudflared-
 
       - if: steps.cloudflared.outputs.cache-hit != 'true'
         run: |
