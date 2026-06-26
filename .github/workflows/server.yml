@@ -86,7 +86,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ./cloudflared
-          key: cloudflared-v1
+          key: cloudflared
 
       - name: Run and Replicate
         run: |
