@@ -57,7 +57,7 @@ jobs:
           key: ollama-granite4
 
       - if: steps.ollama.outputs.cache-hit != 'true'
-        run: ollama pull ibm/granite4:3b-h
+        run: ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M
 
       - if: steps.ollama.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
