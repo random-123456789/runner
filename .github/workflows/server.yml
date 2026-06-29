@@ -12,7 +12,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # --- Ollama Cache ---
+      # ----- Caching: Ollama Models -----
       - uses: actions/cache@v4
         id: ollama
         with:
@@ -20,7 +20,7 @@ jobs:
           key: ollama-distilled-tiny
           restore-keys: ollama-
 
-      # --- Cloudflared Cache ---
+      # ----- Caching: Cloudflared -----
       - uses: actions/cache@v4
         id: cloudflared
         with:
@@ -28,76 +28,75 @@ jobs:
           key: cloudflared
           restore-keys: cloudflared-
 
-      # --- Setup Ollama (only if cache miss) ---
+      # ----- Setup Ollama (only on cache miss) -----
       - if: steps.ollama.outputs.cache-hit != 'true'
         uses: ai-action/setup-ollama@v2
 
-      # --- Pull Custom Model (only if cache miss) ---
+      # ----- Pull the custom model (only on cache miss) -----
       - if: steps.ollama.outputs.cache-hit != 'true'
         run: ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M
 
-      # --- Save Ollama Cache (only if cache miss) ---
+      # ----- Save Ollama cache (only on cache miss) -----
       - if: steps.ollama.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ~/.ollama/models
           key: ollama-distilled-tiny
 
-      # --- Download Cloudflared (only if cache miss) ---
+      # ----- Download Cloudflared (only on cache miss) -----
       - if: steps.cloudflared.outputs.cache-hit != 'true'
         run: |
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # --- Save Cloudflared Cache (only if cache miss) ---
+      # ----- Save Cloudflared cache (only on cache miss) -----
       - if: steps.cloudflared.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ./cloudflared
           key: cloudflared
 
-      # --- Run Ollama, Tunnel, and Self‑Replicate ---
+      # ----- Main: Run Ollama, Tunnel, Update Config, Self‑Replicate -----
       - name: Run and Replicate
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
-          # 🔑 KEY FIX: Bind Ollama to all interfaces
+          # 🔑 CRITICAL FIX – Bind Ollama to all network interfaces
           OLLAMA_HOST: 0.0.0.0:11434
         run: |
           set -e
 
           echo "🚀 Starting Ollama server..."
+          pkill -f ollama 2>/dev/null || true
           ollama serve &
 
-          # Wait for Ollama to be ready (with timeout)
+          # Wait for Ollama to become ready
           echo "⏳ Waiting for Ollama to be ready..."
           for i in {1..20}; do
-            if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+            if curl -s http://localhost:11434/api/tags > /dev/null; then
               echo "✅ Ollama is ready"
               break
             fi
-            echo "⏳ Attempt $i/20 - Ollama not ready yet..."
+            echo "⏳ Attempt $i/20 ..."
             sleep 2
           done
 
           # Verify Ollama is running
-          if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+          if ! curl -s http://localhost:11434/api/tags > /dev/null; then
             echo "❌ Ollama failed to start after 40 seconds"
-            echo "📋 Checking ollama processes..."
             ps aux | grep ollama || true
             exit 1
           fi
 
-          # Ensure model is pulled (idempotent – does nothing if already present)
+          # Ensure the model is pulled (idempotent)
           echo "📦 Pulling model..."
           ollama pull hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M
 
-          # Start Cloudflare tunnel (pointing to Ollama's port 11434)
+          # Start Cloudflare tunnel
           echo "🌐 Starting Cloudflare tunnel..."
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x cloudflared
           fi
-
           pkill -f cloudflared 2>/dev/null || true
           ./cloudflared tunnel --protocol http2 --url http://localhost:11434 2>&1 | tee tunnel.log &
 
@@ -110,21 +109,20 @@ jobs:
               echo "✅ Tunnel URL: ${TUNNEL_URL}"
               break
             fi
-            echo "⏳ Attempt $i/30 - waiting for tunnel..."
+            echo "⏳ Attempt $i/30 ..."
             sleep 2
           done
 
           if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ Failed to get tunnel URL after 60 seconds"
-            echo "📋 Last 20 lines of tunnel.log:"
+            echo "❌ Failed to get tunnel URL"
             tail -20 tunnel.log
             exit 1
           fi
 
           echo "::notice::Tunnel URL: ${TUNNEL_URL}"
 
-          # Update config.json in the chat repo
-          echo "📝 Updating config.json..."
+          # Update config.json in the chat repository
+          echo "📝 Updating frontend config..."
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
@@ -177,8 +175,8 @@ jobs:
             fi
 
             # Health checks – restart if needed
-            if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-              echo "⚠️ Ollama server down – restarting..."
+            if ! curl -s http://localhost:11434/api/tags > /dev/null; then
+              echo "⚠️ Ollama down – restarting..."
               pkill -f ollama 2>/dev/null || true
               ollama serve &
               sleep 5
