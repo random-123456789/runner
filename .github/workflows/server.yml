@@ -58,8 +58,6 @@ jobs:
 
       # ----- Main: Run Ollama + Open WebUI + Tunnel + Self‑Replication -----
       - name: Run and Replicate
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
         run: |
           set -e
 
