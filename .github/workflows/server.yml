@@ -8,138 +8,168 @@ permissions:
   contents: write   # needed to update config.json
 
 jobs:
-  # ----- Worker Bees (19 instances) -----
+  # -------------------------------------------------------------------
+  # Queen Job – orchestrates everything
+  # -------------------------------------------------------------------
+  queen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y jq curl
+
+      - name: Wait for all workers to register
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          echo "👑 Queen waiting for 19 workers to register..."
+
+          # Poll config.json until 19 workers appear
+          for i in {1..60}; do
+            curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${REPO_OWNER}/chat/contents/config.json" \
+              > /tmp/config.json
+
+            WORKER_COUNT=$(jq '.workers | length' /tmp/config.json 2>/dev/null || echo 0)
+            echo "  Attempt $i: $WORKER_COUNT workers registered"
+
+            if [ "$WORKER_COUNT" -ge 19 ]; then
+              echo "✅ All workers registered!"
+              break
+            fi
+            sleep 10
+          done
+
+          if [ "$WORKER_COUNT" -lt 19 ]; then
+            echo "❌ Timeout waiting for workers"
+            exit 1
+          fi
+
+          # Build RPC connection string
+          RPC_ADDRS=$(jq -r '.workers | join(",")' /tmp/config.json)
+          echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
+
+      - name: Download llama.cpp
+        run: |
+          curl -Lo llama.cpp.zip https://github.com/ggerganov/llama.cpp/archive/refs/heads/master.zip
+          unzip -j llama.cpp.zip "llama.cpp-master/build/bin/llama-cli" -d .
+          chmod +x llama-cli
+
+      - name: Download model
+        run: |
+          curl -Lo model.gguf https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-distill-opus-4.5-think-q4_k_m.gguf
+
+      - name: Run distributed inference
+        run: |
+          echo "🧠 Starting distributed inference with workers: ${RPC_ADDRS}"
+          ./llama-cli -m model.gguf \
+            --rpc ${RPC_ADDRS} \
+            --tensor-split 19 \
+            -p "What is the meaning of life?" \
+            -n 256
+
+      - name: Start Cloudflare tunnel for Queen (optional – expose API)
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          # If you want to expose a frontend, start an HTTP server
+          # and tunnel it. Here we just keep the runner alive.
+          echo "👑 Queen finished inference – keeping alive for 6 hours."
+          sleep infinity
+
+  # -------------------------------------------------------------------
+  # Worker Jobs – 19 instances, each runs an RPC server + bore tunnel
+  # -------------------------------------------------------------------
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       matrix:
         instance: [1, 2, 3, 4, 5]
+
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl jq
+          sudo apt-get install -y jq curl
+
+      - name: Install bore
+        run: |
+          curl -Lo bore https://github.com/ekzhang/bore/releases/latest/download/bore-linux-amd64
+          chmod +x bore
+          sudo mv bore /usr/local/bin/
 
       - name: Download llama.cpp RPC server
         run: |
-          # Download pre-built llama-server (or build from source)
-          curl -Lo llama-server https://github.com/ggerganov/llama.cpp/releases/download/b4193/llama-server
-          chmod +x llama-server
+          curl -Lo llama.cpp.zip https://github.com/ggerganov/llama.cpp/archive/refs/heads/master.zip
+          unzip -j llama.cpp.zip "llama.cpp-master/build/bin/llama-rpc-server" -d .
+          chmod +x llama-rpc-server
 
-      - name: Download bore
-        run: |
-          curl -Lo bore https://github.com/ekzhang/bore/releases/download/v0.5.0/bore
-          chmod +x bore
-
-      - name: Start RPC server and bore tunnel
-        id: worker
+      - name: Start llama.cpp RPC server and create bore tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
-          CHAT_REPO: ${{ github.repository_owner }}/chat
+          REPO_OWNER: ${{ github.repository_owner }}
+          INSTANCE_ID: ${{ matrix.instance }}
         run: |
-          # Start llama.cpp RPC server on port 65432
-          ./llama-server --rpc-server --port 65432 &
-          sleep 2
+          echo "🐝 Worker $INSTANCE_ID starting..."
 
-          # Start bore tunnel
-          ./bore local 65432 --to bore.pub 2>&1 | tee bore.log &
+          # Start llama.cpp RPC server on a unique port (based on instance)
+          PORT=$((65430 + INSTANCE_ID))
+          ./llama-rpc-server --port ${PORT} &
 
-          # Wait for bore to assign a public URL
-          for i in {1..30}; do
-            BORE_URL=$(grep -oP 'bore\.pub:\d+' bore.log | head -1)
-            if [ -n "$BORE_URL" ]; then
-              echo "Bore URL: $BORE_URL"
-              break
-            fi
-            sleep 2
-          done
+          # Wait for the server to start
+          sleep 5
 
+          # Create bore tunnel
+          bore local ${PORT} --to bore.pub > /tmp/bore_url.txt 2>&1 &
+          sleep 5
+
+          # Extract the public URL (e.g., bore.pub:12345)
+          BORE_URL=$(grep -oP 'bore\.pub:\d+' /tmp/bore_url.txt | head -1)
           if [ -z "$BORE_URL" ]; then
-            echo "Failed to get bore URL"
+            echo "❌ Failed to get bore URL"
+            cat /tmp/bore_url.txt
             exit 1
           fi
+          echo "✅ Worker $INSTANCE_ID registered at: ${BORE_URL}"
 
-          # Register this worker with config.json (retry on conflict)
-          for attempt in {1..5}; do
-            FILE_INFO=$(curl -s -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
-            SHA=$(echo "$FILE_INFO" | jq -r '.sha')
-            CURRENT=$(echo "$FILE_INFO" | jq -r '.content' | base64 -d)
-            if [ -z "$CURRENT" ]; then
-              echo '{"runners":[]}' > current.json
-            else
-              echo "$CURRENT" > current.json
+          # ---- Register this worker in config.json ----
+          # Fetch current config
+          curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${REPO_OWNER}/chat/contents/config.json" \
+            > /tmp/current.json
+
+          # Append the new URL
+          jq --arg url "$BORE_URL" '.workers = (.workers // []) + [$url]' \
+            /tmp/current.json > /tmp/updated.json
+
+          # Encode and upload back to GitHub
+          CONTENT=$(base64 -w0 /tmp/updated.json)
+          SHA=$(jq -r '.sha' /tmp/current.json)
+
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO_OWNER}/chat/contents/config.json" \
+            -d "{\"message\":\"register worker $INSTANCE_ID\",\"content\":\"${CONTENT}\",\"sha\":\"${SHA}\"}"
+
+          echo "✅ Worker $INSTANCE_ID registered successfully!"
+
+          # ---- Keep the worker alive ----
+          echo "🐝 Worker $INSTANCE_ID keeping tunnel and RPC server alive..."
+          while true; do
+            # Check if RPC server is still running
+            if ! pgrep -f "llama-rpc-server" > /dev/null; then
+              echo "⚠️ RPC server died, restarting..."
+              ./llama-rpc-server --port ${PORT} &
             fi
-            # Add new URL if not already present
-            jq --arg url "$BORE_URL" '.runners += [$url]' current.json > new.json
-            ENCODED=$(base64 -w0 < new.json)
-            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
-              -d "{\"message\":\"register worker ${{ matrix.instance }}\",\"content\":\"${ENCODED}\",\"sha\":\"${SHA}\"}")
-            if echo "$RESPONSE" | jq -e '.commit' > /dev/null; then
-              echo "Registered worker ${{ matrix.instance }}"
-              break
+            # Check if bore tunnel is still running
+            if ! pgrep -f "bore" > /dev/null; then
+              echo "⚠️ Bore tunnel died, restarting..."
+              bore local ${PORT} --to bore.pub &
             fi
-            sleep 2
+            sleep 30
           done
-
-          # Keep the worker alive
-          sleep infinity
-
-  # ----- Queen (1 instance) -----
-  queen:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    needs: worker   # optional: starts after workers, but workers run forever; queen will start after worker jobs are all running (they never finish, so we should not use needs; we can remove needs or use it with caution)
-    # Actually, since workers run indefinitely, the queen would never start if we use `needs`. So we should not use needs.
-    # Instead, we let queen run concurrently and poll config.json.
-    # Remove the `needs` line:
-    steps:
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y curl jq
-
-      - name: Download llama.cpp CLI
-        run: |
-          curl -Lo llama-cli https://github.com/ggerganov/llama.cpp/releases/download/b4193/llama-cli
-          chmod +x llama-cli
-
-      - name: Download model (e.g., Granite Tiny)
-        run: |
-          # We need a GGUF model file; for demo, download a small one
-          curl -Lo model.gguf https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-distill-opus-4.5-think-q4_k_m.gguf
-
-      - name: Queen – discover workers and run inference
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          CHAT_REPO: ${{ github.repository_owner }}/chat
-        run: |
-          # Poll config.json until we have 19 workers
-          MAX_WORKERS=19
-          for i in {1..60}; do
-            FILE_INFO=$(curl -s -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
-            RUNNERS=$(echo "$FILE_INFO" | jq -r '.content' | base64 -d | jq -r '.runners[]')
-            COUNT=$(echo "$RUNNERS" | grep -c . || true)
-            echo "Found $COUNT workers"
-            if [ "$COUNT" -ge "$MAX_WORKERS" ]; then
-              break
-            fi
-            sleep 5
-          done
-
-          # Build the RPC connection string
-          RPC_ARGS=$(echo "$RUNNERS" | sed 's/^/--rpc /' | tr '\n' ',' | sed 's/,$//')
-
-          echo "RPC_ARGS: $RPC_ARGS"
-
-          # Run inference with tensor parallelism across all workers
-          ./llama-cli -m model.gguf $RPC_ARGS -p "What is the capital of France?" -n 100
-
-          # Keep the queen alive (it could also serve as an API endpoint, but for now just runs once)
-          sleep infinity
