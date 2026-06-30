@@ -13,18 +13,17 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Clean workers directory (delete all files)
+      - name: Clean workers directory
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "🧹 STEP 1: Cleaning workers directory..."
+          echo "🧹 Cleaning workers directory..."
           RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
           echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name + ":" + .sha' 2>/dev/null | while IFS=':' read -r name sha; do
             if [ -n "$name" ] && [ -n "$sha" ]; then
-              echo "  Deleting: workers/$name"
               curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
                 -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/${REPO}/contents/workers/${name}" \
@@ -38,7 +37,7 @@ jobs:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "📁 STEP 2: Creating fresh workers directory..."
+          echo "📁 Creating fresh workers directory..."
           RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/contents/workers/.keep" 2>/dev/null)
@@ -143,22 +142,36 @@ jobs:
           echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
           echo "HOLESAIL_URLS=${HOLESAIL_URLS}"
 
-      - name: Connect to workers via Holesail (with unique ports + sleep)
+      # ---------- NOVEL TECHNIQUE: Socat Port Proxy ----------
+      - name: Connect to workers via Holesail + socat proxy
         env:
           HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
         run: |
-          echo "🔗 Connecting to workers via Holesail P2P tunnels..."
+          echo "🔗 Connecting to workers via Holesail P2P tunnels with socat proxy..."
+
+          # Install socat
+          sudo apt-get install -y socat
+
           IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
           LOCAL_PORT=60000
           for url in "${URLS[@]}"; do
-            echo "Connecting to worker with URL: ${url} -> localhost:${LOCAL_PORT}"
-            holesail "${url}" --listen localhost:${LOCAL_PORT} &
-            LOCAL_PORT=$((LOCAL_PORT + 1))
-            sleep 1   # ⬅️ Critical: avoid port-binding race conditions
-          done
-          sleep 15
-          echo "✅ Holesail tunnels established."
+            echo "Connecting to worker with URL: ${url}"
 
+            # Start Holesail client (defaults to port 50052)
+            holesail "${url}" &
+            sleep 2
+
+            # Forward unique port → 50052 using socat
+            socat TCP-LISTEN:${LOCAL_PORT},fork TCP:127.0.0.1:50052 &
+            echo "  ✅ Forwarding localhost:${LOCAL_PORT} → localhost:50052"
+
+            LOCAL_PORT=$((LOCAL_PORT + 1))
+          done
+
+          sleep 15
+          echo "✅ Holesail tunnels established with socat proxies."
+
+      # ---------- LLAMA-SERVER WITH RPC ----------
       - name: Start llama-server with RPC and Cloudflare tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -178,6 +191,7 @@ jobs:
           done
 
           echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
+
           nohup ./llama-server \
             -m model.gguf \
             --rpc ${RPC_ADDRS} \
