@@ -36,14 +36,14 @@ jobs:
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # ── Install Python, Flask, and Exo ──
+      # ── Install Python, Flask, Exo, and requests ──
       - name: Setup Python environment
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y python3-pip python3-venv
           python3 -m venv venv
           source venv/bin/activate
-          pip install --quiet flask exo
+          pip install --quiet flask exo requests
 
       # ── Rendezvous server (Flask) ──
       - name: Start rendezvous server
@@ -99,8 +99,8 @@ jobs:
           python3 rendezvous.py &
           sleep 2
 
-      # ── Start Cloudflare tunnel for coordinator ──
-      - name: Start Cloudflare tunnel
+      # ── Start Cloudflare tunnels ──
+      - name: Start Cloudflare tunnels
         id: tunnel
         run: |
           if [ ! -f ./cloudflared ]; then
@@ -134,7 +134,17 @@ jobs:
           echo "::notice::Rendezvous URL: ${RENDEZVOUS_URL}"
           echo "::notice::EXO Dashboard: ${EXO_URL}"
 
-      # ── Start EXO coordinator (with manual discovery pointing to rendezvous) ──
+          # Write rendezvous URL to a file for artifact
+          echo "$RENDEZVOUS_URL" > rendezvous_url.txt
+
+      - name: Upload rendezvous URL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendezvous-url
+          path: rendezvous_url.txt
+          retention-days: 1
+
+      # ── Start EXO coordinator (with manual discovery) ──
       - name: Start EXO coordinator
         run: |
           source venv/bin/activate
@@ -148,11 +158,9 @@ jobs:
           }
           EOF
 
-          # Start EXO with manual discovery pointing to the rendezvous endpoint
-          # We'll use a script that periodically fetches the latest config from rendezvous
+          # Simple wrapper: fetch discovery.json periodically and restart EXO if needed
           cat > exo_wrapper.py << 'PYEOF'
-          import subprocess, time, json, requests, os
-          import signal, sys
+          import subprocess, time, json, requests, os, sys, signal
 
           RENDEZVOUS_URL = os.environ.get("RENDEZVOUS_URL")
           if not RENDEZVOUS_URL:
@@ -178,15 +186,11 @@ jobs:
                  "--discovery-config-path", "/tmp/discovery.json"]
           proc = subprocess.Popen(cmd)
 
-          # Monitor and update config periodically
+          # Periodically refresh config (EXO may not pick up changes, but we'll keep it)
           try:
               while True:
-                  time.sleep(30)
+                  time.sleep(60)
                   fetch_config()
-                  # Send SIGHUP to EXO to reload config? EXO doesn't support reload.
-                  # Instead, we'll restart EXO if config changed.
-                  # For simplicity, we just keep it running; EXO will pick up new nodes
-                  # via periodic re-read of the config file (if implemented).
           except KeyboardInterrupt:
               proc.terminate()
           PYEOF
@@ -195,7 +199,6 @@ jobs:
           python3 exo_wrapper.py &
           EXO_PID=$!
 
-          # Wait a bit for EXO to start
           sleep 10
 
       # ── Self-replication keepalive ──
@@ -254,20 +257,16 @@ jobs:
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # ── Install Python and Exo ──
+      # ── Install Python, Exo, and requests ──
       - name: Setup Python environment
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y python3-pip python3-venv
           python3 -m venv venv
           source venv/bin/activate
-          pip install --quiet exo
+          pip install --quiet exo requests
 
-      # ── Get coordinator rendezvous URL ──
-      # The coordinator prints its rendezvous URL in its logs; we can retrieve it
-      # via the GitHub API (run ID) or via a shared artifact.
-      # For simplicity, we'll retrieve it from the coordinator's logs by using
-      # the GitHub API to fetch the run's annotations.
+      # ── Get coordinator rendezvous URL via artifact ──
       - name: Retrieve rendezvous URL
         id: get_rendezvous
         env:
@@ -275,12 +274,7 @@ jobs:
         run: |
           RUN_ID="${{ github.run_id }}"
           REPO="${{ github.repository }}"
-          # Wait for coordinator to start and upload the URL
           for i in {1..20}; do
-            # Check if coordinator has output the URL
-            # We can fetch the run's annotations or use a shared artifact.
-            # Here we use an artifact approach:
-            # Coordinator uploads rendezvous_url.txt artifact.
             ARTIFACT_ID=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/actions/runs/${RUN_ID}/artifacts" \
