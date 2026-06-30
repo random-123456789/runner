@@ -1,4 +1,4 @@
-name: Ray‑vLLM Swarm (5 Workers)
+name: Ray‑vLLM with bore (5 Workers)
 
 on:
   workflow_dispatch:
@@ -18,9 +18,12 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y jq curl build-essential cmake python3-pip
 
-      - name: Install Ray and vLLM
+      - name: Install Ray, vLLM, and bore
         run: |
           pip install ray[default] vllm
+          curl -Lo bore https://github.com/ekzhang/bore/releases/latest/download/bore-linux-amd64
+          chmod +x bore
+          sudo mv bore /usr/local/bin/
 
       # ---------- CLEANUP ----------
       - name: Clean workers directory
@@ -55,14 +58,38 @@ jobs:
             -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
           echo "✅ workers directory ready."
 
-      # ---------- START RAY HEAD ----------
-      - name: Start Ray head and wait for 5 workers
+      # ---------- START RAY HEAD + BORE TUNNEL ----------
+      - name: Start Ray head and expose via bore
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           echo "🚀 Starting Ray head node..."
           ray start --head --port=6379 --dashboard-host=0.0.0.0 --dashboard-port=8265
+
+          # Expose port 6379 via bore
+          echo "🔗 Exposing Ray head port via bore..."
+          bore local 6379 --to bore.pub > /tmp/bore_url.txt 2>&1 &
+          sleep 5
+
+          # Extract the bore public address (e.g., bore.pub:12345)
+          BORE_URL=$(grep -oP 'listening at \Kbore\.pub:\d+' /tmp/bore_url.txt | head -1)
+          if [ -z "$BORE_URL" ]; then
+            echo "❌ Failed to get bore URL"
+            cat /tmp/bore_url.txt
+            exit 1
+          fi
+          echo "✅ Ray head reachable at: $BORE_URL"
+
+          # Write the bore URL to the repo so workers can find it
+          WORKER_FILE="workers/ray_head.json"
+          mkdir -p workers
+          echo "{\"url\": \"${BORE_URL}\"}" > ${WORKER_FILE}
+          ENCODED=$(base64 -w0 ${WORKER_FILE})
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
+            -d "{\"message\":\"register ray head\",\"content\":\"${ENCODED}\"}"
 
           echo "👑 Queen waiting for 5 workers..."
           for attempt in {1..60}; do
@@ -88,7 +115,7 @@ jobs:
           fi
 
       # ---------- DOWNLOAD MODEL ----------
-      - name: Download model (GGUF)
+      - name: Download model
         run: |
           MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
           curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
@@ -100,19 +127,15 @@ jobs:
           fi
 
       # ---------- START vLLM SERVER WITH RAY ----------
-      - name: Start vLLM server with Ray (tensor_parallel_size=5)
+      - name: Start vLLM server with Ray
         run: |
           echo "🌐 Starting vLLM server with Ray (5 workers)..."
           python3 - <<'EOF'
           import ray
           from vllm import LLM, SamplingParams
           import time
-          import os
 
-          # Connect to the local Ray cluster (head)
           ray.init(address='auto', ignore_reinit_error=True)
-
-          # Load the model with tensor parallelism across 5 workers
           llm = LLM(
               model='./model.gguf',
               tensor_parallel_size=5,
@@ -120,15 +143,12 @@ jobs:
               enforce_eager=True,
               trust_remote_code=True,
           )
-
-          print("✅ vLLM model loaded, server ready on port 8000")
-          # Keep the process alive
+          print("✅ vLLM model loaded")
           while True:
               time.sleep(60)
           EOF &
           sleep 15
 
-          # Health check
           for i in {1..20}; do
             if curl -s http://localhost:8000/health > /dev/null; then
               echo "✅ vLLM server is ready"
@@ -142,18 +162,13 @@ jobs:
             exit 1
           fi
 
-      # ---------- CLOUDFLARE TUNNEL ----------
-      - name: Start Cloudflare tunnel
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO_OWNER: ${{ github.repository_owner }}
+      # ---------- CLOUDFLARE TUNNEL FOR FRONTEND ----------
+      - name: Start Cloudflare tunnel for frontend
         run: |
           echo "🌐 Starting Cloudflare tunnel..."
-
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
           nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8000 > tunnel.log 2>&1 &
-
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$TUNNEL_URL" ]; then
@@ -167,8 +182,6 @@ jobs:
             tail -50 tunnel.log
             exit 1
           fi
-
-          # Update config.json
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
@@ -184,14 +197,10 @@ jobs:
               "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
               -d "$PAYLOAD"
           fi
-
           echo "::notice::Frontend URL: https://$CHAT_REPO"
           echo "🔄 Queen is serving. Keeping alive..."
           sleep infinity
 
-  # ====================================================================
-  # WORKER JOBS – 5 workers join the Ray cluster
-  # ====================================================================
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -208,7 +217,7 @@ jobs:
       - name: Install Ray
         run: pip install ray[default]
 
-      - name: Start Ray worker and register
+      - name: Connect to Ray head via bore URL
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -217,18 +226,29 @@ jobs:
           set -e
           echo "🐝 Worker $INSTANCE_ID starting..."
 
-          # Wait for Ray head to be ready
+          # Fetch the bore URL from workers/ray_head.json
           for attempt in {1..30}; do
-            if nc -zv queen 6379 2>/dev/null; then
-              echo "✅ Ray head is reachable"
-              break
+            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers/ray_head.json")
+            if [ "$(echo "$RESPONSE" | jq -r '.sha' 2>/dev/null)" != "null" ]; then
+              BORE_URL=$(echo "$RESPONSE" | jq -r '.content' | base64 -d | jq -r '.url')
+              if [ -n "$BORE_URL" ]; then
+                echo "✅ Found Ray head at: $BORE_URL"
+                break
+              fi
             fi
-            echo "⏳ Waiting for Ray head... ($attempt/30)"
+            echo "⏳ Waiting for ray_head.json... ($attempt/30)"
             sleep 2
           done
 
-          # Start Ray worker and connect to head
-          ray start --address='queen:6379' --num-cpus=4
+          if [ -z "$BORE_URL" ]; then
+            echo "❌ Failed to get Ray head URL"
+            exit 1
+          fi
+
+          # Start Ray worker and connect to head via bore URL
+          ray start --address="$BORE_URL" --num-cpus=4
 
           # Register worker
           WORKER_FILE="workers/ray_worker_${INSTANCE_ID}.json"
@@ -241,7 +261,6 @@ jobs:
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
             SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
-
             if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
               PAYLOAD=$(jq -n \
                 --arg msg "register worker $INSTANCE_ID" \
@@ -254,24 +273,20 @@ jobs:
                 --arg content "$ENCODED" \
                 '{message: $msg, content: $content}')
             fi
-
             RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
               -d "$PAYLOAD")
-
             if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
               echo "✅ Worker $INSTANCE_ID registered successfully!"
               break
             fi
-
             STATUS=$(echo "$RESPONSE" | jq -r '.status' 2>/dev/null)
             if [ "$STATUS" = "409" ]; then
               echo "⚠️ Conflict detected – retrying in 3 seconds..."
               sleep 3
               continue
             fi
-
             echo "❌ Failed to register worker $INSTANCE_ID"
             echo "Response: $RESPONSE"
             exit 1
@@ -280,7 +295,7 @@ jobs:
           while true; do
             if ! pgrep -f "ray" > /dev/null; then
               echo "⚠️ Ray worker died, restarting..."
-              ray start --address='queen:6379' --num-cpus=4
+              ray start --address="$BORE_URL" --num-cpus=4
             fi
             sleep 30
           done
