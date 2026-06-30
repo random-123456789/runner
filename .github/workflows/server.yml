@@ -8,9 +8,6 @@ permissions:
   contents: write
 
 jobs:
-  # =====================================================================
-  # QUEEN JOB – Orchestrates everything + serves Open WebUI
-  # =====================================================================
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -21,17 +18,23 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y jq curl build-essential cmake python3 python3-pip
 
-      - name: Clean workers directory (fresh start)
+      - name: Clean and recreate workers directory
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           echo "🧹 Cleaning workers directory..."
-          # Delete workers directory recursively (ignore 404)
           curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/${REPO}/contents/workers" \
             -d '{"message":"cleanup","sha":""}' 2>/dev/null || true
           echo "✅ Cleanup done."
+          echo "📁 Creating fresh workers directory..."
+          echo "" | base64 -w0 > empty_keep
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
+            -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
+          echo "✅ workers directory ready."
 
       - name: Build llama-cli with RPC support
         run: |
@@ -112,7 +115,6 @@ jobs:
           REPO_OWNER: ${{ github.repository_owner }}
           RPC_ADDRS: ${{ env.RPC_ADDRS }}
         run: |
-          # 1. Write the Ollama‑compatible API server (listens on port 8000)
           cat > server.py << 'EOF'
           import subprocess
           import json
@@ -169,22 +171,18 @@ jobs:
           server.serve_forever()
           EOF
 
-          # 2. Start the API server
           python3 server.py &
           sleep 5
 
-          # 3. Install and run Open WebUI
           pip install --quiet open-webui
           export OLLAMA_BASE_URL=http://localhost:8000
           open-webui serve --host 0.0.0.0 --port 3000 &
           sleep 10
 
-          # 4. Cloudflare tunnel to port 3000 (Open WebUI)
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
           ./cloudflared tunnel --protocol http2 --url http://localhost:3000 2>&1 | tee tunnel.log &
 
-          # 5. Extract tunnel URL
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$TUNNEL_URL" ]; then
@@ -194,7 +192,6 @@ jobs:
             sleep 2
           done
 
-          # 6. Update config.json in the chat repo
           if [ -n "$TUNNEL_URL" ]; then
             CHAT_REPO="${{ github.repository_owner }}/chat"
             NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
@@ -214,13 +211,8 @@ jobs:
             echo "::notice::Frontend URL: https://$CHAT_REPO"
           fi
 
-          # 7. Keep the runner alive
-          echo "🔄 Queen is serving Open WebUI. Keeping alive..."
           sleep infinity
 
-  # =====================================================================
-  # WORKER JOBS – 10 instances with staggered start
-  # =====================================================================
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -301,7 +293,6 @@ jobs:
             exit 1
           fi
 
-          # Keep alive
           while true; do
             if ! pgrep -f "ggml-rpc-server" > /dev/null; then
               echo "⚠️ RPC server died, restarting..."
