@@ -8,18 +8,12 @@ permissions:
   contents: write
 
 env:
-  # Exo-compatible tiny model. Exo downloads/weights it automatically.
   EXO_MODEL: "llama-3.2-1b"
-  # Exo web/API port (hardcoded default).
   EXO_API_PORT: 8000
-  # Exo peer-to-peer port used by workers.
   EXO_PEER_PORT: 50052
 
 jobs:
 
-  # ------------------------------------------------------------------------
-  # Bootstrap — create the workers registry directory before anyone writes.
-  # ------------------------------------------------------------------------
   bootstrap:
     runs-on: ubuntu-latest
     steps:
@@ -46,9 +40,6 @@ jobs:
               -d "{\"message\":\"create workers dir\",\"content\":\"$EMPTY\"}" || true
           fi
 
-  # ------------------------------------------------------------------------
-  # Workers — each one runs an Exo node and tunnels it through Holesail.
-  # ------------------------------------------------------------------------
   worker:
     needs: bootstrap
     runs-on: ubuntu-latest
@@ -70,15 +61,9 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install exo --quiet
-          echo "---- Exo version / help ----"
-          exo --version 2>&1 || true
-          exo --help 2>&1 | head -60 || true
-
-      - name: Pre-download model (optional but recommended)
-        run: |
-          echo "📥 Pre-downloading ${EXO_MODEL} on worker..."
-          # Exo downloads on first use; this just warms the cache.
-          timeout 300 exo --node-id worker-${{ matrix.instance }}-warmup --default-model "${EXO_MODEL}" --timeout 300 --help || true
+          echo "---- Exo help ----"
+          exo -h 2>&1 | head -80 || true
+          exo --help 2>&1 | head -80 || true
 
       - name: Start Exo node and Holesail server
         env:
@@ -91,9 +76,7 @@ jobs:
           mkdir -p logs
 
           echo "🐝 Worker $INSTANCE_ID starting Exo node..."
-          # Exo node listens on 0.0.0.0 so Holesail can reach it.
           nohup exo \
-            --node-id "worker-${INSTANCE_ID}" \
             --host 0.0.0.0 \
             --port ${PORT} \
             > logs/exo.log 2>&1 &
@@ -175,10 +158,9 @@ jobs:
           while true; do
             sleep 30
 
-            if ! pgrep -f "exo.*worker-${INSTANCE_ID}" >/dev/null; then
+            if ! pgrep -f "exo" >/dev/null; then
               echo "⚠️ Exo process died — restarting..."
               nohup exo \
-                --node-id "worker-${INSTANCE_ID}" \
                 --host 0.0.0.0 \
                 --port ${PORT} \
                 > logs/exo.log 2>&1 &
@@ -199,10 +181,6 @@ jobs:
             fi
           done
 
-  # ------------------------------------------------------------------------
-  # Queen — opens Holesail clients to every worker, then starts the central
-  # Exo node in star topology and exposes the web API via Cloudflare.
-  # ------------------------------------------------------------------------
   queen:
     needs: bootstrap
     runs-on: ubuntu-latest
@@ -221,8 +199,9 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install exo --quiet
-          exo --version 2>&1 || true
-          exo --help 2>&1 | head -60 || true
+          echo "---- Exo help ----"
+          exo -h 2>&1 | head -80 || true
+          exo --help 2>&1 | head -80 || true
 
       - name: Wait for workers and collect Holesail URLs
         env:
@@ -310,12 +289,9 @@ jobs:
 
           echo "👑 Starting Exo queen node..."
           echo "   Peers: ${EXO_PEERS}"
-          echo "   API will be on: http://127.0.0.1:${API_PORT}"
 
           mkdir -p logs
-          # Exo queen: explicit peers so mDNS is not required.
           nohup exo \
-            --node-id "queen" \
             --host 0.0.0.0 \
             --port ${PEER_PORT} \
             --peers "${EXO_PEERS}" \
@@ -372,7 +348,6 @@ jobs:
           echo "::notice::Public API: $TUNNEL_URL"
           echo "::notice::Chat completions: $TUNNEL_URL/v1/chat/completions"
 
-          # Optional: update chat frontend repo config
           CHAT_REPO="${{ github.repository_owner }}/chat"
           CFG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl:$url}')
           ENC=$(echo "$CFG" | base64 -w0)
@@ -388,7 +363,6 @@ jobs:
               "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" -d "$PAYLOAD"
           fi
 
-          # Keep alive with health polling
           while kill -0 $EXO_PID 2>/dev/null; do
             if ! curl -fs --max-time 5 "http://127.0.0.1:${API_PORT}/v1/models" >/dev/null 2>&1; then
               echo "⚠️ Exo API health check failed"
