@@ -13,9 +13,6 @@ permissions:
   contents: read
 
 jobs:
-  # ════════════════════════════════════════════════════════════
-  #  JOB 0 – COORDINATOR (First Exo node)
-  # ════════════════════════════════════════════════════════════
   coordinator:
     name: "🧠 Coordinator"
     runs-on: ubuntu-latest
@@ -24,7 +21,6 @@ jobs:
       tunnel_url: ${{ steps.tunnel.outputs.url }}
 
     steps:
-      # ── Cache: cloudflared ──
       - uses: actions/cache@v4
         id: cf_cache
         with:
@@ -36,7 +32,6 @@ jobs:
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # ── Install Exo ──
       - name: Setup Python and Exo
         run: |
           sudo apt-get update -qq
@@ -45,15 +40,15 @@ jobs:
           source venv/bin/activate
           pip install --quiet exo
 
-      # ── Start EXO coordinator ──
       - name: Start EXO coordinator
+        env:
+          EXO_LIBP2P_NAMESPACE: exo-swarm-${{ github.run_id }}
         run: |
           source venv/bin/activate
-          # Start exo with a node ID – this enables UDP broadcast discovery
-          exo --node-id coordinator &
-          sleep 5
+          # Run exo – it will auto-discover peers via UDP broadcast
+          uv run exo &
+          sleep 10
 
-      # ── Start Cloudflare tunnel to Exo dashboard ──
       - name: Start Cloudflare tunnel
         id: tunnel
         run: |
@@ -61,7 +56,6 @@ jobs:
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x cloudflared
           fi
-
           ./cloudflared tunnel --protocol http2 --url http://localhost:52415 2>&1 | tee tunnel.log &
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
@@ -71,7 +65,6 @@ jobs:
           echo "::notice::EXO Dashboard: ${TUNNEL_URL}"
           echo "url=${TUNNEL_URL}" >> "$GITHUB_OUTPUT"
 
-      # ── Self-replication keepalive ──
       - name: Self-replication keepalive
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -79,31 +72,20 @@ jobs:
           START_TIME=$(date +%s)
           TRIGGER_AT=$((350 * 60))
           TRIGGERED=false
-
           while true; do
             ELAPSED=$(( $(date +%s) - START_TIME ))
-
             if [ $ELAPSED -ge $TRIGGER_AT ] && [ "$TRIGGERED" = "false" ]; then
-              echo "⏰ Triggering replacement workflow..."
               curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
                 -H "Accept: application/vnd.github.v3+json" \
                 "https://api.github.com/repos/${{ github.repository }}/actions/workflows/exo-swarm.yml/dispatches" \
                 -d "{\"ref\":\"${{ github.ref }}\",\"inputs\":{\"model\":\"${{ github.event.inputs.model }}\"}}"
               TRIGGERED=true
             fi
-
-            # Health checks
-            pgrep -f exo > /dev/null || (source venv/bin/activate && exo --node-id coordinator &)
+            pgrep -f exo > /dev/null || (source venv/bin/activate && uv run exo &)
             pgrep -f cloudflared > /dev/null || ./cloudflared tunnel --protocol http2 --url http://localhost:52415 2>&1 | tee -a tunnel.log &
-
             sleep 30
           done
 
-
-  # ════════════════════════════════════════════════════════════
-  #  JOBS 1–19 – EXO WORKER NODES
-  #  Each worker joins the cluster via UDP broadcast
-  # ════════════════════════════════════════════════════════════
   worker:
     name: "⚙️ Worker ${{ matrix.worker_id }}"
     runs-on: ubuntu-latest
@@ -115,7 +97,6 @@ jobs:
         worker_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
 
     steps:
-      # ── Install Exo ──
       - name: Setup Python and Exo
         run: |
           sudo apt-get update -qq
@@ -124,18 +105,18 @@ jobs:
           source venv/bin/activate
           pip install --quiet exo
 
-      # ── Join EXO cluster ──
       - name: Join EXO cluster
+        env:
+          EXO_LIBP2P_NAMESPACE: exo-swarm-${{ github.run_id }}
         run: |
           source venv/bin/activate
-          # exo automatically discovers other nodes via UDP broadcast
-          # All runners in the same Azure region can see each other
-          exo --node-id worker-${{ matrix.worker_id }} &
+          # exo auto-discovers other nodes with the same namespace
+          uv run exo &
           echo "✅ Worker ${{ matrix.worker_id }} joined cluster"
 
           while true; do
             if ! pgrep -f exo > /dev/null; then
-              exo --node-id worker-${{ matrix.worker_id }} &
+              uv run exo &
             fi
             sleep 30
           done
