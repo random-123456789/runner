@@ -8,6 +8,9 @@ permissions:
   contents: write
 
 jobs:
+  # ===================================================================
+  # QUEEN JOB
+  # ===================================================================
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -40,30 +43,49 @@ jobs:
           REPO_NAME: ${{ github.repository }}
         run: |
           echo "👑 Queen waiting for 19 workers..."
+
           for attempt in {1..60}; do
+            # List all files in workers/ directory
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/workers.json")
-            if [ "$(echo "$RESPONSE" | jq -r '.sha')" = "null" ]; then
-              echo "  workers.json not yet created"
-              sleep 5
-              continue
+              "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/workers" 2>/dev/null)
+
+            if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
+              WORKER_COUNT=0
+            else
+              WORKER_FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
+              WORKER_COUNT=$(echo "$WORKER_FILES" | grep -c . || echo 0)
             fi
-            CONTENT_JSON=$(echo "$RESPONSE" | jq -r '.content' | base64 -d)
-            WORKER_COUNT=$(echo "$CONTENT_JSON" | jq '.workers | length')
+
             echo "  Attempt $attempt: $WORKER_COUNT workers registered"
+
             if [ "$WORKER_COUNT" -ge 19 ]; then
               echo "✅ All workers registered!"
-              RPC_ADDRS=$(echo "$CONTENT_JSON" | jq -r '.workers | join(",")')
-              echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
               break
             fi
             sleep 5
           done
-          if [ -z "$RPC_ADDRS" ]; then
+
+          if [ "$WORKER_COUNT" -lt 19 ]; then
             echo "❌ Timeout waiting for workers"
             exit 1
           fi
+
+          # Build RPC connection string
+          RPC_ADDRS=""
+          for file in $WORKER_FILES; do
+            curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/workers/${file}" \
+              > /tmp/worker.json
+            URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url')
+            if [ -n "$RPC_ADDRS" ]; then
+              RPC_ADDRS="${RPC_ADDRS},${URL}"
+            else
+              RPC_ADDRS="${URL}"
+            fi
+          done
+
+          echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
 
       - name: Run distributed inference
         run: |
@@ -77,12 +99,15 @@ jobs:
       - name: Keep queen alive
         run: sleep infinity
 
+  # ===================================================================
+  # WORKER JOBS
+  # ===================================================================
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       matrix:
-        instance: [1, 2, 3, 4, 5]
+        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
 
     steps:
       - name: Install dependencies
@@ -110,7 +135,7 @@ jobs:
           cd ../..
           chmod +x ggml-rpc-server
 
-      - name: Start RPC server and register with bore
+      - name: Start RPC server and register
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
@@ -118,6 +143,7 @@ jobs:
           INSTANCE_ID: ${{ matrix.instance }}
         run: |
           echo "🐝 Worker $INSTANCE_ID starting..."
+
           PORT=$((65430 + INSTANCE_ID))
 
           ./ggml-rpc-server -p ${PORT} &
@@ -134,47 +160,18 @@ jobs:
           fi
           echo "✅ Worker $INSTANCE_ID tunnel: ${BORE_URL}"
 
-          # ---------- Register in workers.json with retry ----------
-          for attempt in {1..30}; do
-            echo "Attempt $attempt: Registering worker $INSTANCE_ID"
+          # ---------- Write to workers/w<id>.json ----------
+          WORKER_FILE="workers/w${INSTANCE_ID}.json"
+          mkdir -p workers
+          echo "{\"url\": \"${BORE_URL}\"}" > ${WORKER_FILE}
+          ENCODED=$(base64 -w0 ${WORKER_FILE})
 
-            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/workers.json")
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/${WORKER_FILE}" \
+            -d "{\"message\":\"register worker $INSTANCE_ID\",\"content\":\"${ENCODED}\"}"
 
-            SHA=$(echo "$RESPONSE" | jq -r '.sha // ""')
-            if [ "$SHA" = "null" ] || [ -z "$SHA" ]; then
-              CONTENT_JSON='{"workers": []}'
-              SHA=""
-            else
-              CONTENT_JSON=$(echo "$RESPONSE" | jq -r '.content' | base64 -d)
-            fi
-
-            UPDATED_JSON=$(echo "$CONTENT_JSON" | jq --arg url "$BORE_URL" '.workers += [$url]')
-            ENCODED=$(echo "$UPDATED_JSON" | base64 -w0)
-
-            if [ -z "$SHA" ]; then
-              PAYLOAD=$(jq -n --arg msg "register worker $INSTANCE_ID" --arg content "$ENCODED" \
-                '{message: $msg, content: $content}')
-            else
-              PAYLOAD=$(jq -n --arg msg "register worker $INSTANCE_ID" --arg content "$ENCODED" --arg sha "$SHA" \
-                '{message: $msg, content: $content, sha: $sha}')
-            fi
-
-            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/workers.json" \
-              -d "$PAYLOAD")
-
-            if echo "$RESPONSE" | jq -e '.message | contains("409")' > /dev/null; then
-              echo "Conflict detected – retrying in 2 seconds..."
-              sleep 2
-              continue
-            fi
-
-            echo "✅ Worker $INSTANCE_ID registered successfully!"
-            break
-          done
+          echo "✅ Worker $INSTANCE_ID registered successfully!"
 
           # Keep alive
           while true; do
