@@ -284,8 +284,8 @@ jobs:
           ./ggml-rpc-server -p ${PORT} &
           sleep 5
 
-          # Generate a valid base32 Holesail key (only A-Z and 2-7)
-          KEY=$(openssl rand -base32 16)
+          # ✅ Generate a valid base32 Holesail key (32 chars, A-Z and 2-7 only)
+          KEY=$(openssl rand -base64 20 | base32 | tr -d '=' | head -c 32)
           echo "✅ Worker $INSTANCE_ID generated key: ${KEY}"
 
           # Create Holesail tunnel that exposes the RPC server
