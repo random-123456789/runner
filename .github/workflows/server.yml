@@ -21,6 +21,17 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y jq curl build-essential cmake python3
 
+      # --- Connect to Tailscale network ---
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          tags: tag:github-actions
+
+      - name: Show Tailscale IP
+        run: |
+          echo "Queen Tailscale IP: $(tailscale ip -4)"
+
       - name: Clean and recreate workers directory
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -70,7 +81,7 @@ jobs:
             exit 1
           fi
 
-      - name: Wait for workers and collect URLs
+      - name: Wait for workers and collect Tailscale IPs
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -103,6 +114,7 @@ jobs:
               "https://api.github.com/repos/${REPO}/contents/workers/${file}" \
               > /tmp/worker.json
             URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url')
+            # URL is now "100.64.0.x:65431"
             if [ -n "$RPC_ADDRS" ]; then
               RPC_ADDRS="${RPC_ADDRS},${URL}"
             else
@@ -112,14 +124,11 @@ jobs:
           echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
           echo "RPC_ADDRS=${RPC_ADDRS}"
 
-      # -----------------------------------------------------------------
-      # 🔍 DEBUG: Test llama-server with RPC directly
-      # -----------------------------------------------------------------
-      - name: Debug llama-server (manual test)
+      # --- Debug: Test llama-server with RPC ---
+      - name: Debug llama-server
         run: |
-          echo "🧪 Testing llama-server with RPC workers..."
+          echo "🧪 Testing llama-server with Tailscale RPC workers..."
           echo "RPC_ADDRS: ${RPC_ADDRS}"
-          echo "Starting llama-server in debug mode..."
           timeout 10 ./llama-server \
             -m model.gguf \
             --rpc ${RPC_ADDRS} \
@@ -130,19 +139,16 @@ jobs:
             2>&1 | head -50 || true
           echo "=== Debug test finished ==="
 
-      # -----------------------------------------------------------------
-      # 🚀 Start llama-server and Cloudflare tunnel
-      # -----------------------------------------------------------------
+      # --- Start llama-server and Cloudflare tunnel ---
       - name: Start llama-server and Cloudflare tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
           RPC_ADDRS: ${{ env.RPC_ADDRS }}
         run: |
-          echo "🌐 Starting llama-server with RPC workers..."
+          echo "🌐 Starting llama-server with Tailscale RPC workers..."
           echo "RPC_ADDRS: ${RPC_ADDRS}"
 
-          # Start llama-server with RPC
           nohup ./llama-server \
             -m model.gguf \
             --rpc ${RPC_ADDRS} \
@@ -152,7 +158,6 @@ jobs:
             --port 8080 \
             > server.log 2>&1 &
 
-          # Wait for server to be ready
           for i in {1..20}; do
             if curl -s http://localhost:8080/health > /dev/null; then
               echo "✅ llama-server is ready"
@@ -167,15 +172,11 @@ jobs:
             exit 1
           fi
 
-          # Start Cloudflare tunnel to port 8080
-          echo "🌐 Starting Cloudflare tunnel..."
-          if [ ! -f ./cloudflared ]; then
-            curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-            chmod +x cloudflared
-          fi
+          # Cloudflare tunnel (port 8080)
+          curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
           nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
 
-          # Extract tunnel URL
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$TUNNEL_URL" ]; then
@@ -192,7 +193,7 @@ jobs:
             exit 1
           fi
 
-          # Update config.json in the chat repo
+          # Update config.json
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
@@ -210,12 +211,10 @@ jobs:
           fi
           echo "::notice::Frontend URL: https://$CHAT_REPO"
 
-          # Keep alive
-          echo "🔄 Queen is serving. Keeping alive..."
           sleep infinity
 
   # =====================================================================
-  # WORKER JOBS – 10 instances with staggered start + retry on 409
+  # WORKER JOBS – 10 instances with Tailscale
   # =====================================================================
   worker:
     runs-on: ubuntu-latest
@@ -236,13 +235,16 @@ jobs:
           echo "⏳ Worker ${{ matrix.instance }} waiting ${DELAY}s before starting..."
           sleep ${DELAY}
 
-      - name: Install bore
+      # --- Connect to Tailscale ---
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          tags: tag:github-actions
+
+      - name: Show Tailscale IP
         run: |
-          curl -Lo bore.tar.gz https://github.com/ekzhang/bore/releases/latest/download/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz
-          tar -xzf bore.tar.gz
-          chmod +x bore
-          sudo mv bore /usr/local/bin/
-          bore --version
+          echo "Worker ${{ matrix.instance }} Tailscale IP: $(tailscale ip -4)"
 
       - name: Build ggml-rpc-server
         run: |
@@ -256,33 +258,27 @@ jobs:
           cd ../..
           chmod +x ggml-rpc-server
 
-      - name: Start RPC server and register (with retry on 409)
+      - name: Start RPC server and register with Tailscale IP
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
           INSTANCE_ID: ${{ matrix.instance }}
         run: |
           echo "🐝 Worker $INSTANCE_ID starting..."
-
           PORT=$((65430 + INSTANCE_ID))
 
+          # Get Tailscale IP
+          TAILSCALE_IP=$(tailscale ip -4)
+          echo "Worker $INSTANCE_ID Tailscale IP: ${TAILSCALE_IP}"
+
+          # Start ggml-rpc-server
           ./ggml-rpc-server -p ${PORT} &
           sleep 5
 
-          bore local ${PORT} --to bore.pub > /tmp/bore_url.txt 2>&1 &
-          sleep 5
-
-          BORE_URL=$(grep -oP 'bore\.pub:\d+' /tmp/bore_url.txt | head -1)
-          if [ -z "$BORE_URL" ]; then
-            echo "❌ Failed to get bore URL"
-            cat /tmp/bore_url.txt
-            exit 1
-          fi
-          echo "✅ Worker $INSTANCE_ID tunnel: ${BORE_URL}"
-
+          # Register with Tailscale IP and port
           WORKER_FILE="workers/w${INSTANCE_ID}.json"
           mkdir -p workers
-          echo "{\"url\": \"${BORE_URL}\"}" > ${WORKER_FILE}
+          echo "{\"url\": \"${TAILSCALE_IP}:${PORT}\"}" > ${WORKER_FILE}
           ENCODED=$(base64 -w0 ${WORKER_FILE})
 
           for attempt in {1..10}; do
@@ -333,14 +329,11 @@ jobs:
             exit 1
           fi
 
+          # Keep alive – no bore needed
           while true; do
             if ! pgrep -f "ggml-rpc-server" > /dev/null; then
               echo "⚠️ RPC server died, restarting..."
               ./ggml-rpc-server -p ${PORT} &
-            fi
-            if ! pgrep -f "bore" > /dev/null; then
-              echo "⚠️ Bore tunnel died, restarting..."
-              bore local ${PORT} --to bore.pub &
             fi
             sleep 30
           done
