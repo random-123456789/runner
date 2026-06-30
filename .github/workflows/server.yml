@@ -1,61 +1,36 @@
-name: ShardRing Server
+name: Exo Swarm
 
 on:
   workflow_dispatch:
     inputs:
       model:
-        description: "Ollama model tag to run"
+        description: "Model to run (HuggingFace ID)"
         required: false
-        default: "hf.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF:Q4_K_M"
-      shard_count:
-        description: "Number of worker shards (max 19)"
-        required: false
-        default: "19"
+        default: "mlx-community/Llama-3.2-1B-Instruct-4bit"
 
 permissions:
   actions: write
   contents: read
 
-# ─────────────────────────────────────────────────────────────
-#  ARCHITECTURE:  Shard-Ring Topology
-#
-#  Coordinator (job 1):
-#    • Owns the model file split into N shards
-#    • Uploads each shard as a GitHub Actions artifact (fast bus)
-#    • Runs a tiny HTTP rendezvous server (port 9000)
-#    • Accepts worker registrations → builds ring address table
-#    • Issues inference tokens round-robin to ring workers
-#    • Assembles streamed KV-cache partial results → final output
-#    • Exposes OpenWebUI + Cloudflare tunnel to user
-#
-#  Workers (jobs 2–20):
-#    • Each downloads its assigned shard artifact
-#    • Loads ONLY its shard layer range into Ollama
-#    • Registers its Cloudflare tunnel URL with coordinator
-#    • Pulls next-token from coordinator, runs forward pass on
-#      its layers, pushes KV-cache delta back → ring continues
-#    • No worker talks to another worker directly (star, not mesh)
-#
-#  Why this is NOT a load balancer:
-#    • Each worker owns DIFFERENT model layers (tensor sharding)
-#    • Every token requires ALL workers in sequence (pipeline)
-#    • The coordinator is the ring-token holder, not a proxy
-#    • Workers are stateful: they hold KV cache between tokens
-# ─────────────────────────────────────────────────────────────
-
 jobs:
-
-  # ════════════════════════════════════════════════════════════
-  #  JOB 0 – COORDINATOR  (1 × 4 vCPU / 16 GB)
-  # ════════════════════════════════════════════════════════════
+  # ─────────────────────────────────────────────────────────────
+  #  JOB 0 – COORDINATOR NODE
+  #  Runs Exo in coordinator mode (or full mode)
+  # ─────────────────────────────────────────────────────────────
   coordinator:
-    name: "🧠 Coordinator"
+    name: "🧠 Coordinator Node"
     runs-on: ubuntu-latest
     timeout-minutes: 360
     outputs:
       tunnel_url: ${{ steps.tunnel.outputs.url }}
 
     steps:
+      # ── Checkout Exo repo ──
+      - uses: actions/checkout@v4
+        with:
+          repository: exo-explore/exo
+          token: ${{ secrets.TOKEN }}
+          path: exo
 
       # ── Cache: cloudflared ──
       - uses: actions/cache@v4
@@ -69,411 +44,68 @@ jobs:
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      - if: steps.cf_cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ./cloudflared
-          key: cloudflared-v1
-
-      # ── Install Python tools ──
-      # NOTE: Coordinator does NOT install Ollama or pull any model.
-      # It only orchestrates workers — the model lives entirely in worker shards.
-      - name: Setup Python env
+      # ── Setup Python, Node, Rust ──
+      - name: Setup dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y python3-pip python3-venv jq curl
-          python3 -m venv venv
-          source venv/bin/activate
-          pip install --quiet flask requests
+          sudo apt-get install -y python3-pip python3-venv nodejs npm curl
 
-      # ── Download model (for sharding only), split, upload, then purge ──
-      - name: Shard model and upload artifacts
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          SHARD_COUNT: ${{ github.event.inputs.shard_count }}
-          MODEL: ${{ github.event.inputs.model }}
+          # Install uv
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+
+          # Install Rust
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source $HOME/.cargo/env
+          rustup toolchain install nightly
+
+          # Install Node dependencies
+          cd exo/dashboard
+          npm install
+          npm run build
+          cd ../..
+
+      # ── Start Exo coordinator ──
+      - name: Start Exo
         run: |
-          set -e
+          cd exo
+          source $HOME/.cargo/env
+          export PATH="$HOME/.cargo/bin:$PATH"
 
-          # Install Ollama transiently — only to download the model blob for splitting.
-          # The install script starts Ollama as a systemd service (ollama user).
-          # We MUST wait for the API to be reachable before issuing pull.
-          curl -fsSL https://ollama.com/install.sh | sh
+          # Start Exo (runs dashboard on port 52415)
+          uv run exo &
+          EXO_PID=$!
 
-          echo "⏳ Waiting for Ollama systemd service to be ready..."
-          for i in {1..30}; do
-            curl -s http://localhost:11434/api/tags > /dev/null 2>&1 && echo "✅ Ollama API ready" && break
-            sleep 2
-          done
-          if ! curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-            echo "❌ Ollama service never became ready — dumping diagnostics"
-            systemctl status ollama || true
-            journalctl -u ollama --no-pager -n 30 || true
-            exit 1
-          fi
-
-          ollama pull "$MODEL"
-
-          # Systemd service runs as the 'ollama' user → blobs land in /usr/share/ollama/.ollama
-          # or /home/ollama/.ollama — search both, then runner's ~/.ollama as fallback
-          MODEL_FILE=$(find /usr/share/ollama/.ollama /home/ollama/.ollama ~/.ollama \
-            -type f \( -name "*.gguf" -o -size +10M \) 2>/dev/null | head -1)
-          if [ -z "$MODEL_FILE" ]; then
-            echo "❌ Could not locate model blob after pull"
-            find /usr/share/ollama/.ollama /home/ollama/.ollama ~/.ollama -type f 2>/dev/null | head -20
-            exit 1
-          fi
-
-          echo "📁 Model file: $MODEL_FILE ($(du -sh "$MODEL_FILE" | cut -f1))"
-          FILE_SIZE=$(stat -c%s "$MODEL_FILE")
-          SHARD_SIZE=$(( FILE_SIZE / SHARD_COUNT ))
-          echo "📊 ${FILE_SIZE} bytes → ${SHARD_COUNT} shards of ~${SHARD_SIZE} bytes each"
-
-          mkdir -p shards
-          split -b "$SHARD_SIZE" -d "$MODEL_FILE" shards/shard_
-
-          # Manifest
-          python3 - << PYEOF
-          import json, os
-          shards = sorted(f for f in os.listdir('shards') if f.startswith('shard_'))
-          manifest = {
-            'model': os.environ['MODEL'],
-            'total_shards': len(shards),
-            'coordinator_run_id': '${{ github.run_id }}',
-            'shards': [{'index': i, 'file': s} for i, s in enumerate(shards)]
-          }
-          with open('shards/manifest.json', 'w') as f:
-            json.dump(manifest, f, indent=2)
-          print(json.dumps(manifest, indent=2))
-          PYEOF
-
-          # Stop service + purge all model blobs — coordinator must NOT run inference
-          sudo systemctl stop ollama 2>/dev/null || true
-          sudo systemctl disable ollama 2>/dev/null || true
-          sudo rm -rf /usr/share/ollama/.ollama /home/ollama/.ollama ~/.ollama
-          echo "🗑️  Ollama stopped + purged — inference lives in workers only"
-
-      - name: Upload shard bundle
-        uses: actions/upload-artifact@v4
-        with:
-          name: model-shards-${{ github.run_id }}
-          path: shards/
-          retention-days: 1
-          compression-level: 0   # Already compressed GGUF
-
-      # ── Start rendezvous + Chat UI + Tunnels (NO Ollama on coordinator) ──
-      - name: Start rendezvous + chat UI + tunnels
-        id: tunnel
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          SHARD_COUNT: ${{ github.event.inputs.shard_count }}
-          MODEL: ${{ github.event.inputs.model }}
-          RUN_ID: ${{ github.run_id }}
-        run: |
-          set -e
-
-          # ── Rendezvous server (Flask) ──
-          # Workers POST their shard_index + tunnel_url here to register
-          # Coordinator tracks which shards are online
-          # Once all registered → coordinator is ready to handle inference requests
-          cat > rendezvous.py << 'PYEOF'
-          import threading, json, time, sys, os
-          from flask import Flask, request, jsonify
-
-          app = Flask(__name__)
-          lock = threading.Lock()
-
-          SHARD_COUNT  = int(os.environ.get("SHARD_COUNT", "19"))
-          workers      = {}   # shard_index → {url, ready}
-          token_queue  = []   # pending inference requests
-          result_parts = {}   # request_id → {shard_index: partial_result}
-          requests_db  = {}   # request_id → full request info
-
-          @app.route("/register", methods=["POST"])
-          def register():
-              data = request.json
-              idx  = int(data["shard_index"])
-              url  = data["url"]
-              with lock:
-                  workers[idx] = {"url": url, "ready": True, "registered_at": time.time()}
-              print(f"✅ Worker {idx} registered: {url} ({len(workers)}/{SHARD_COUNT})", flush=True)
-              return jsonify({"status": "ok", "total_registered": len(workers)})
-
-          @app.route("/status", methods=["GET"])
-          def status():
-              with lock:
-                  return jsonify({
-                      "registered": len(workers),
-                      "expected": SHARD_COUNT,
-                      "ready": len(workers) >= SHARD_COUNT,
-                      "workers": {str(k): v["url"] for k, v in workers.items()}
-                  })
-
-          @app.route("/workers", methods=["GET"])
-          def get_workers():
-              # Returns ordered list of worker URLs for pipeline execution
-              with lock:
-                  ordered = [workers[i]["url"] for i in sorted(workers.keys())]
-                  return jsonify({"pipeline": ordered, "count": len(ordered)})
-
-          @app.route("/infer", methods=["POST"])
-          def infer():
-              """
-              Coordinator receives inference request, fans out to all workers
-              in pipeline order, assembles result.
-              Strategy: Sequential ring pass
-                1. Send prompt + context to Worker[0]
-                2. Worker[0] processes its layers, returns KV-cache delta
-                3. Forward delta to Worker[1], and so on
-                4. Worker[N-1] returns final logits
-                5. Coordinator decodes token, loops for next token
-              """
-              import uuid, requests as req
-              data     = request.json
-              prompt   = data.get("prompt", "")
-              req_id   = str(uuid.uuid4())[:8]
-
-              with lock:
-                  pipeline = [workers[i]["url"] for i in sorted(workers.keys())]
-
-              if not pipeline:
-                  return jsonify({"error": "No workers registered"}), 503
-
-              print(f"🔁 Inference req {req_id}: pipeline len={len(pipeline)}", flush=True)
-
-              # Pass context through pipeline (each worker adds its layer output)
-              context = {"prompt": prompt, "req_id": req_id, "kv_cache": None, "layer_offset": 0}
-
-              for i, worker_url in enumerate(pipeline):
-                  try:
-                      resp = req.post(
-                          f"{worker_url}/process",
-                          json=context,
-                          timeout=120
-                      )
-                      if resp.ok:
-                          result   = resp.json()
-                          context["kv_cache"]     = result.get("kv_cache")
-                          context["layer_offset"] = result.get("next_layer_offset", 0)
-                          context["partial"]      = result.get("partial_output", "")
-                      else:
-                          print(f"⚠️  Worker {i} ({worker_url}) error: {resp.status_code}", flush=True)
-                  except Exception as e:
-                      print(f"⚠️  Worker {i} ({worker_url}) exception: {e}", flush=True)
-
-              final_output = context.get("partial", "")
-              print(f"✅ Inference {req_id} complete: {len(final_output)} chars", flush=True)
-              return jsonify({"response": final_output, "req_id": req_id})
-
-          if __name__ == "__main__":
-              print(f"🔀 Rendezvous server starting (expecting {SHARD_COUNT} workers)...", flush=True)
-              app.run(host="0.0.0.0", port=9000, threaded=True)
-          PYEOF
-
-          source venv/bin/activate
-
-          # ── Start rendezvous (pipeline orchestrator + worker registry) ──
-          # Coordinator does NO model inference — it only holds the ring token
-          # and passes context sequentially through the 19 worker pipeline.
-          python3 rendezvous.py &
-          RENDEZVOUS_PID=$!
-
-          # ── Lightweight Chat UI (pure pipeline proxy, zero Ollama) ──
-          # Serves a minimal web UI on port 3000 that POSTs to /infer
-          # /infer runs the full worker pipeline and streams the response back.
-          # No Ollama, no model weights, no fallback inference on this machine.
-          cat > chat_ui.py << 'UIEOF'
-          import os
-          from flask import Flask, request, jsonify, Response, stream_with_context
-          import requests as req, json, threading, time
-
-          app = Flask(__name__)
-
-          INFER_URL = "http://localhost:9000/infer"
-          STATUS_URL = "http://localhost:9000/status"
-
-          CHAT_HTML = """<!DOCTYPE html>
-          <html lang="en">
-          <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width,initial-scale=1">
-            <title>ShardRing Chat</title>
-            <style>
-              body{font-family:system-ui,sans-serif;max-width:800px;margin:40px auto;padding:0 20px;background:#0f0f0f;color:#e0e0e0}
-              h1{color:#7c9eff;margin-bottom:4px}
-              #status{font-size:12px;color:#888;margin-bottom:20px}
-              #chat{border:1px solid #333;border-radius:8px;height:420px;overflow-y:auto;padding:16px;background:#1a1a1a;margin-bottom:12px}
-              .msg{margin:10px 0;line-height:1.6}
-              .user{color:#7c9eff;font-weight:600}
-              .assistant{color:#a8e6a3}
-              .error{color:#ff6b6b}
-              #input-row{display:flex;gap:8px}
-              #prompt{flex:1;padding:10px 14px;border-radius:6px;border:1px solid #333;background:#1a1a1a;color:#e0e0e0;font-size:14px}
-              #send{padding:10px 20px;background:#7c9eff;color:#000;border:none;border-radius:6px;cursor:pointer;font-weight:600}
-              #send:disabled{opacity:.4;cursor:default}
-              #workers{font-size:11px;color:#555;margin-top:8px}
-            </style>
-          </head>
-          <body>
-            <h1>⚙️ ShardRing Inference</h1>
-            <div id="status">Checking pipeline status...</div>
-            <div id="chat"></div>
-            <div id="input-row">
-              <input id="prompt" type="text" placeholder="Type a message..." autocomplete="off">
-              <button id="send" onclick="sendMsg()">Send</button>
-            </div>
-            <div id="workers"></div>
-            <script>
-              async function poll(){
-                try{
-                  const r=await fetch('/api/status');
-                  const d=await r.json();
-                  document.getElementById('status').textContent=
-                    d.ready
-                      ? '✅ Pipeline ready — '+d.registered+'/'+d.expected+' shards online'
-                      : '⏳ Waiting for workers: '+d.registered+'/'+d.expected+' registered';
-                  const wu=Object.values(d.workers||{}).map((u,i)=>'Shard '+i+': '+u).join(' | ');
-                  document.getElementById('workers').textContent=wu;
-                }catch(e){document.getElementById('status').textContent='⚠️ Coordinator unreachable';}
-              }
-              setInterval(poll,4000); poll();
-
-              async function sendMsg(){
-                const el=document.getElementById('prompt');
-                const btn=document.getElementById('send');
-                const prompt=el.value.trim();
-                if(!prompt) return;
-                el.value=''; btn.disabled=true;
-                const chat=document.getElementById('chat');
-                chat.innerHTML+='<div class="msg"><span class="user">You:</span> '+escHtml(prompt)+'</div>';
-                const replyEl=document.createElement('div');
-                replyEl.className='msg';
-                replyEl.innerHTML='<span class="assistant">Assistant:</span> <span id="resp">…</span>';
-                chat.appendChild(replyEl);
-                chat.scrollTop=chat.scrollHeight;
-                try{
-                  const r=await fetch('/api/infer',{
-                    method:'POST',
-                    headers:{'Content-Type':'application/json'},
-                    body:JSON.stringify({prompt})
-                  });
-                  const d=await r.json();
-                  document.getElementById('resp').textContent=d.response||d.error||'(empty)';
-                  if(d.error) replyEl.classList.add('error');
-                }catch(e){
-                  document.getElementById('resp').textContent='Error: '+e.message;
-                  replyEl.classList.add('error');
-                }
-                btn.disabled=false; chat.scrollTop=chat.scrollHeight;
-              }
-              document.getElementById('prompt').addEventListener('keydown',e=>{if(e.key==='Enter')sendMsg();});
-              function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-            </script>
-          </body>
-          </html>"""
-
-          @app.route("/")
-          def index():
-              return CHAT_HTML, 200, {"Content-Type": "text/html"}
-
-          @app.route("/api/status")
-          def api_status():
-              try:
-                  r = req.get(STATUS_URL, timeout=5)
-                  return jsonify(r.json())
-              except Exception as e:
-                  return jsonify({"error": str(e), "registered": 0, "expected": 19, "ready": False}), 503
-
-          @app.route("/api/infer", methods=["POST"])
-          def api_infer():
-              data = request.json
-              prompt = data.get("prompt", "")
-              if not prompt:
-                  return jsonify({"error": "empty prompt"}), 400
-              try:
-                  r = req.post(INFER_URL, json={"prompt": prompt}, timeout=300)
-                  return jsonify(r.json())
-              except Exception as e:
-                  return jsonify({"error": str(e)}), 503
-
-          if __name__ == "__main__":
-              print("🖥️  Chat UI starting on :3000 (no local model — pure pipeline proxy)", flush=True)
-              app.run(host="0.0.0.0", port=3000, threaded=True)
-          UIEOF
-
-          python3 chat_ui.py &
-          sleep 3
-
-          for i in {1..10}; do
-            curl -s http://localhost:3000 > /dev/null && echo "✅ Chat UI ready (pipeline proxy only, no local model)" && break
+          # Wait for Exo to be ready
+          for i in {1..20}; do
+            if curl -s http://localhost:52415/health > /dev/null 2>&1; then
+              echo "✅ Exo coordinator ready"
+              break
+            fi
             sleep 2
           done
 
-          # ── Cloudflare tunnel → Chat UI ──
-          ./cloudflared tunnel --protocol http2 --url http://localhost:3000 2>&1 | tee tunnel.log &
+          # ── Start Cloudflare tunnel ──
+          if [ ! -f ../cloudflared ]; then
+            curl -Lo ../cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+            chmod +x ../cloudflared
+          fi
+          pkill -f cloudflared 2>/dev/null || true
+          ../cloudflared tunnel --protocol http2 --url http://localhost:52415 2>&1 | tee tunnel.log &
 
+          # Extract tunnel URL
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            [ -n "$TUNNEL_URL" ] && echo "✅ Tunnel: $TUNNEL_URL" && break
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "✅ Tunnel URL: ${TUNNEL_URL}"
+              break
+            fi
             sleep 2
           done
 
-          # ── Rendezvous tunnel (workers need to reach coordinator) ──
-          ./cloudflared tunnel --protocol http2 --url http://localhost:9000 2>&1 | tee rendezvous_tunnel.log &
-
-          for i in {1..30}; do
-            RENDEZVOUS_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' rendezvous_tunnel.log | head -1)
-            [ -n "$RENDEZVOUS_URL" ] && echo "✅ Rendezvous URL: $RENDEZVOUS_URL" && break
-            sleep 2
-          done
-
-          echo "::notice::Chat UI: ${TUNNEL_URL}"
-          echo "::notice::Rendezvous: ${RENDEZVOUS_URL}"
+          echo "::notice::Exo Dashboard: ${TUNNEL_URL}"
           echo "url=${TUNNEL_URL}" >> "$GITHUB_OUTPUT"
 
-          # ── Store rendezvous URL so workers can find it ──
-          # Workers read it from the workflow run's annotations or a shared artifact
-          echo "$RENDEZVOUS_URL" > rendezvous_url.txt
-
-      # Upload rendezvous URL for workers to consume
-      - name: Upload rendezvous URL artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rendezvous-url-${{ github.run_id }}
-          path: rendezvous_url.txt
-          retention-days: 1
-
-      # ── Update frontend config ──
-      - name: Update frontend config
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
-        run: |
-          CHAT_REPO="${{ github.repository_owner }}/chat"
-          NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
-          ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
-          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
-          SHA=$(echo "$FILE_INFO" | jq -r '.sha // empty')
-          if [ -n "$SHA" ]; then
-            PAYLOAD=$(jq -n --arg m "update API URL" --arg c "$ENCODED" --arg s "$SHA" \
-              '{message:$m,content:$c,sha:$s}')
-          else
-            PAYLOAD=$(jq -n --arg m "add API URL" --arg c "$ENCODED" \
-              '{message:$m,content:$c}')
-          fi
-          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
-            -d "$PAYLOAD"
-          echo "::notice::Frontend: https://${{ github.repository_owner }}.github.io/chat/"
-
-      # ── Self-replication loop ──
-      - name: Self-replication keepalive
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-        run: |
+          # ── Self-replication loop ──
           START_TIME=$(date +%s)
           TRIGGER_AT=$((350 * 60))
           TRIGGERED=false
@@ -485,285 +117,89 @@ jobs:
               echo "⏰ Triggering replacement workflow..."
               curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
                 -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/server.yml/dispatches" \
-                -d "{\"ref\":\"${{ github.ref }}\",\"inputs\":{\"model\":\"${{ github.event.inputs.model }}\",\"shard_count\":\"${{ github.event.inputs.shard_count }}\"}}"
+                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/exo-swarm.yml/dispatches" \
+                -d "{\"ref\":\"${{ github.ref }}\",\"inputs\":{\"model\":\"${{ github.event.inputs.model }}\"}}"
               TRIGGERED=true
             fi
 
-            # Health checks — coordinator runs NO model inference; only guard the UI + tunnels
-            curl -s http://localhost:9000/status > /dev/null || (source venv/bin/activate; python3 rendezvous.py &)
-            curl -s http://localhost:3000 > /dev/null || (source venv/bin/activate; python3 chat_ui.py &)
-            pgrep -f "cloudflared.*3000" > /dev/null || ./cloudflared tunnel --protocol http2 --url http://localhost:3000 2>&1 | tee -a tunnel.log &
-            pgrep -f "cloudflared.*9000" > /dev/null || ./cloudflared tunnel --protocol http2 --url http://localhost:9000 2>&1 | tee -a rendezvous_tunnel.log &
+            if ! curl -s http://localhost:52415/health > /dev/null 2>&1; then
+              cd exo
+              uv run exo &
+            fi
+            if ! pgrep -f cloudflared > /dev/null; then
+              ../cloudflared tunnel --protocol http2 --url http://localhost:52415 2>&1 | tee -a tunnel.log &
+            fi
 
             sleep 30
           done
 
 
-  # ════════════════════════════════════════════════════════════
-  #  JOBS 1–19 – SHARD WORKERS  (19 × 4 vCPU / 16 GB each)
-  #  Total worker pool: 76 vCPU / 304 GB RAM
-  # ════════════════════════════════════════════════════════════
-  #
-  #  Each worker:
-  #   1. Downloads the shard bundle artifact
-  #   2. Extracts ONLY its assigned shard (by matrix index)
-  #   3. Downloads rendezvous URL artifact
-  #   4. Starts a tiny HTTP server on port 8000 exposing /process
-  #   5. Opens a Cloudflare tunnel → registers URL with coordinator
-  #   6. Listens for pipeline requests, runs Ollama on its shard
-  #   7. Returns KV-cache delta back to coordinator
-  #
-  #  NOVEL: Workers do NOT talk to each other.
-  #         The coordinator holds the ring token and
-  #         passes context sequentially through the pipeline.
-  #         This gives pipeline parallelism without a load balancer:
-  #         each worker is a "layer server" in a deep pipeline.
-
+  # ─────────────────────────────────────────────────────────────
+  #  JOBS 1–19 – EXO WORKER NODES
+  #  Each node runs Exo and joins the cluster automatically
+  # ─────────────────────────────────────────────────────────────
   worker:
-    name: "⚙️ Worker Shard ${{ matrix.shard_index }}"
+    name: "⚙️ Worker ${{ matrix.node_id }}"
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    needs: coordinator   # ensures coordinator uploads artifacts first
-
     strategy:
       fail-fast: false
       matrix:
-        shard_index: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18]
+        node_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
 
     steps:
-
-      # ── Cache: cloudflared ──
-      - uses: actions/cache@v4
-        id: cf_cache
+      # ── Checkout Exo repo ──
+      - uses: actions/checkout@v4
         with:
-          path: ./cloudflared
-          key: cloudflared-v1
+          repository: exo-explore/exo
+          token: ${{ secrets.TOKEN }}
+          path: exo
 
-      - if: steps.cf_cache.outputs.cache-hit != 'true'
-        run: |
-          curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x cloudflared
-
-      # ── Install Python ──
-      - name: Setup Python
+      # ── Setup dependencies ──
+      - name: Setup dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y python3-pip python3-venv jq curl
-          python3 -m venv venv
-          source venv/bin/activate
-          pip install --quiet flask requests
+          sudo apt-get install -y python3-pip python3-venv nodejs npm curl
 
-      # ── Download shard bundle from coordinator ──
-      - name: Download shard bundle
-        uses: actions/download-artifact@v4
-        with:
-          name: model-shards-${{ github.run_id }}
-          path: shards/
+          curl -LsSf https://astral.sh/uv/install.sh | sh
 
-      # ── Download rendezvous URL ──
-      - name: Download rendezvous URL
-        uses: actions/download-artifact@v4
-        with:
-          name: rendezvous-url-${{ github.run_id }}
-          path: ./
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source $HOME/.cargo/env
+          rustup toolchain install nightly
 
-      # ── Install Ollama ──
-      - uses: ai-action/setup-ollama@v2
+          cd exo/dashboard
+          npm install
+          npm run build
+          cd ../..
 
-      # ── Run worker shard server ──
-      - name: Run shard worker
-        env:
-          SHARD_INDEX: ${{ matrix.shard_index }}
-          GH_TOKEN: ${{ secrets.TOKEN }}
+      # ── Start Exo worker ──
+      - name: Start Exo worker
         run: |
-          set -e
-          source venv/bin/activate
+          cd exo
+          source $HOME/.cargo/env
+          export PATH="$HOME/.cargo/bin:$PATH"
 
-          SHARD_INDEX="${{ matrix.shard_index }}"
-          RENDEZVOUS_URL=$(cat rendezvous_url.txt | tr -d '[:space:]')
+          # Exo automatically discovers other nodes via libp2p/zenoh
+          # No configuration needed – just start it
+          uv run exo &
+          EXO_PID=$!
 
-          echo "🔧 Worker ${SHARD_INDEX} starting..."
-          echo "📡 Rendezvous: ${RENDEZVOUS_URL}"
-
-          # ── Find this worker's shard file ──
-          # Shards are named shard_00, shard_01, etc
-          SHARD_FILE=$(ls shards/shard_* | sort | sed -n "$((SHARD_INDEX + 1))p")
-          echo "📦 My shard: ${SHARD_FILE}"
-
-          # ── Reconstitute partial model from this shard ──
-          # For Ollama, we create a Modelfile that loads from the shard path
-          # (In a real GGUF split scenario, Ollama supports --lora-path and
-          # split GGUF via llama.cpp's --split-mode; here we use the shard
-          # as the model blob directly for demonstration)
-          mkdir -p ~/.ollama/models/blobs
-          cp "$SHARD_FILE" ~/.ollama/models/blobs/sha256-shard${SHARD_INDEX}
-
-          # Create a minimal Modelfile pointing to this shard
-          cat > Modelfile << EOF
-          FROM $SHARD_FILE
-          PARAMETER num_ctx 4096
-          PARAMETER num_predict 128
-          PARAMETER num_thread 4
-          PARAMETER temperature 0.7
-          EOF
-
-          # Start Ollama
-          export OLLAMA_HOST=0.0.0.0:$((11434 + SHARD_INDEX))
-          export OLLAMA_NUM_PARALLEL=1
-          export OLLAMA_MAX_LOADED_MODELS=1
-          export OLLAMA_FLASH_ATTENTION=true
-          export OLLAMA_NUM_GPU=0   # CPU only per worker
-
-          ollama serve &
-          OLLAMA_PORT=$((11434 + SHARD_INDEX))
-          sleep 5
-
+          # Wait for Exo to be ready
           for i in {1..20}; do
-            curl -s http://localhost:${OLLAMA_PORT}/api/tags > /dev/null && echo "✅ Ollama ready on :${OLLAMA_PORT}" && break
-            sleep 3
-          done
-
-          # Create shard model in Ollama
-          ollama create shard-${SHARD_INDEX} -f Modelfile 2>/dev/null || true
-
-          # ── Worker HTTP server ──
-          # Exposes /process endpoint:
-          #   Input:  {prompt, req_id, kv_cache, layer_offset}
-          #   Output: {kv_cache, next_layer_offset, partial_output}
-          cat > worker_server.py << PYEOF
-          import os, json, time, requests
-          from flask import Flask, request, jsonify
-
-          app = Flask(__name__)
-          SHARD_INDEX = int(os.environ.get("SHARD_INDEX", "0"))
-          OLLAMA_PORT = 11434 + SHARD_INDEX
-
-          @app.route("/health", methods=["GET"])
-          def health():
-              return jsonify({"status": "ok", "shard": SHARD_INDEX})
-
-          @app.route("/process", methods=["POST"])
-          def process():
-              """
-              Receives pipeline context from coordinator.
-              Runs inference on this shard's layers.
-              Returns updated context for next shard in pipeline.
-              """
-              data         = request.json
-              prompt       = data.get("prompt", "")
-              kv_cache     = data.get("kv_cache")      # Previous shard's KV state
-              layer_offset = data.get("layer_offset", 0)
-              req_id       = data.get("req_id", "?")
-
-              # If we have a KV cache from the previous shard, inject it as context
-              # For Ollama's REST API, we pass the previous output as part of the prompt
-              if kv_cache:
-                  effective_prompt = f"[LAYER_STATE:{layer_offset}]{kv_cache}\n{prompt}"
-              else:
-                  effective_prompt = prompt
-
-              try:
-                  resp = requests.post(
-                      f"http://localhost:{OLLAMA_PORT}/api/generate",
-                      json={
-                          "model": f"shard-{SHARD_INDEX}",
-                          "prompt": effective_prompt,
-                          "stream": False,
-                          "options": {
-                              "num_predict": 64,
-                              "num_ctx": 4096,
-                              "temperature": 0.7
-                          }
-                      },
-                      timeout=90
-                  )
-                  if resp.ok:
-                      result = resp.json()
-                      output = result.get("response", "")
-                      # Return this shard's output as the KV cache for the next shard
-                      return jsonify({
-                          "kv_cache": output,
-                          "next_layer_offset": layer_offset + 1,
-                          "partial_output": output,
-                          "shard": SHARD_INDEX,
-                          "req_id": req_id
-                      })
-                  else:
-                      return jsonify({"error": f"Ollama error {resp.status_code}", "shard": SHARD_INDEX}), 500
-              except Exception as e:
-                  return jsonify({"error": str(e), "shard": SHARD_INDEX}), 500
-
-          if __name__ == "__main__":
-              print(f"⚙️  Shard worker {SHARD_INDEX} server starting on :8000", flush=True)
-              app.run(host="0.0.0.0", port=8000, threaded=False)
-          PYEOF
-
-          # Start worker server
-          python3 worker_server.py &
-          WORKER_PID=$!
-          sleep 3
-
-          # Verify worker server is up
-          for i in {1..10}; do
-            curl -s http://localhost:8000/health > /dev/null && echo "✅ Worker server ready" && break
-            sleep 2
-          done
-
-          # ── Open Cloudflare tunnel to worker server ──
-          ./cloudflared tunnel --protocol http2 --url http://localhost:8000 2>&1 | tee worker_tunnel.log &
-
-          for i in {1..30}; do
-            WORKER_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' worker_tunnel.log | head -1)
-            [ -n "$WORKER_URL" ] && echo "✅ Worker tunnel: $WORKER_URL" && break
-            sleep 2
-          done
-
-          if [ -z "$WORKER_URL" ]; then
-            echo "❌ Worker tunnel failed"
-            tail -20 worker_tunnel.log
-            exit 1
-          fi
-
-          echo "::notice::Worker ${SHARD_INDEX} URL: ${WORKER_URL}"
-
-          # ── Register with coordinator ──
-          echo "📝 Registering shard ${SHARD_INDEX} with coordinator..."
-          for attempt in {1..10}; do
-            RESULT=$(curl -s -X POST "${RENDEZVOUS_URL}/register" \
-              -H "Content-Type: application/json" \
-              -d "{\"shard_index\": ${SHARD_INDEX}, \"url\": \"${WORKER_URL}\"}")
-            if echo "$RESULT" | grep -q '"ok"'; then
-              echo "✅ Registered: $RESULT"
+            if curl -s http://localhost:52415/health > /dev/null 2>&1; then
+              echo "✅ Worker ${{ matrix.node_id }} ready"
               break
             fi
-            echo "⏳ Attempt ${attempt}/10 failed, retrying..."
-            sleep 10
+            sleep 2
           done
 
+          echo "::notice::Worker ${{ matrix.node_id }} joined cluster"
+
           # ── Keepalive loop ──
-          echo "🔄 Worker ${SHARD_INDEX} keepalive loop..."
-          START_TIME=$(date +%s)
-          TRIGGER_AT=$((350 * 60))
-          TRIGGERED=false
-
           while true; do
-            ELAPSED=$(( $(date +%s) - START_TIME ))
-
-            if [ $ELAPSED -ge $TRIGGER_AT ] && [ "$TRIGGERED" = "false" ]; then
-              TRIGGERED=true  # Coordinator handles re-triggering; workers just exit cleanly
+            if ! curl -s http://localhost:52415/health > /dev/null 2>&1; then
+              cd exo
+              uv run exo &
             fi
-
-            # Health checks
-            curl -s http://localhost:8000/health > /dev/null || python3 worker_server.py &
-            pgrep -f cloudflared > /dev/null || (
-              ./cloudflared tunnel --protocol http2 --url http://localhost:8000 2>&1 | tee -a worker_tunnel.log &
-              sleep 10
-              NEW_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' worker_tunnel.log | tail -1)
-              [ -n "$NEW_URL" ] && curl -s -X POST "${RENDEZVOUS_URL}/register" \
-                -H "Content-Type: application/json" \
-                -d "{\"shard_index\": ${SHARD_INDEX}, \"url\": \"${NEW_URL}\"}"
-            )
-
             sleep 30
           done
