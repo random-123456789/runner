@@ -1,4 +1,4 @@
-name: P2P Inference Mesh (Holesail) – 19 Workers
+name: P2P Inference Mesh (Holesail)
 
 on:
   workflow_dispatch:
@@ -93,13 +93,12 @@ jobs:
             exit 1
           fi
 
-      # ---------- WAIT FOR 19 WORKERS ----------
       - name: Wait for workers and collect Holesail URLs
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "👑 Queen waiting for 19 workers..."
+          echo "👑 Queen waiting for 5 workers..."
           for attempt in {1..60}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -111,18 +110,16 @@ jobs:
               WORKER_COUNT=$(echo "$WORKER_FILES" | grep -c . || echo 0)
             fi
             echo "  Attempt $attempt: $WORKER_COUNT workers registered"
-            if [ "$WORKER_COUNT" -ge 19 ]; then
-              echo "✅ All 19 workers registered!"
+            if [ "$WORKER_COUNT" -ge 5 ]; then
+              echo "✅ All workers registered!"
               break
             fi
             sleep 5
           done
-          if [ "$WORKER_COUNT" -lt 19 ]; then
+          if [ "$WORKER_COUNT" -lt 5 ]; then
             echo "❌ Timeout waiting for workers"
             exit 1
           fi
-
-          # Build HOLESAIL_URLS and count
           HOLESAIL_URLS=""
           for file in $WORKER_FILES; do
             curl -s -H "Authorization: Bearer $GH_TOKEN" \
@@ -143,56 +140,49 @@ jobs:
             exit 1
           fi
           echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
-          # Count workers for tensor-split
-          WORKER_COUNT=$(echo "$HOLESAIL_URLS" | tr ',' '\n' | wc -l)
-          echo "WORKER_COUNT=$WORKER_COUNT" >> $GITHUB_ENV
 
-      # ---------- DOCKERIZED HOLESAIL CLIENTS ----------
-      - name: Connect to workers via Dockerized Holesail
+      # ---------- FIX: Use `--port` to bind each client to a unique local port ----------
+      - name: Connect to workers via Holesail (unique ports)
         env:
           HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
         run: |
-          echo "🔗 Connecting to workers via Dockerized Holesail P2P tunnels..."
-
-          # Clean up old containers
-          docker rm -f $(docker ps -aq) 2>/dev/null || true
+          echo "🔗 Connecting to workers via Holesail P2P tunnels..."
 
           IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
-          HOST_PORT=60000
-          CONTAINER_PORTS=""
-          for i in "${!URLS[@]}"; do
-            URL="${URLS[$i]}"
-            CONTAINER_NAME="holesail-$i"
-            echo "Starting Docker container for worker $i with URL: ${URL}"
-            docker run -d --rm --name ${CONTAINER_NAME} -p ${HOST_PORT}:50052 node:22-alpine \
-              sh -c "npm install -g holesail && holesail '${URL}'" || true
-            CONTAINER_PORTS="${CONTAINER_PORTS},127.0.0.1:${HOST_PORT}"
-            HOST_PORT=$((HOST_PORT + 1))
-            sleep 2
+          LOCAL_PORT=60000
+          RPC_ADDRS=""
+
+          for url in "${URLS[@]}"; do
+            echo "Connecting worker ${url} → localhost:${LOCAL_PORT}"
+            # Use --port to force client to listen on a specific local port
+            holesail "${url}" --port ${LOCAL_PORT} &
+
+            if [ -n "$RPC_ADDRS" ]; then
+              RPC_ADDRS="${RPC_ADDRS},127.0.0.1:${LOCAL_PORT}"
+            else
+              RPC_ADDRS="127.0.0.1:${LOCAL_PORT}"
+            fi
+
+            LOCAL_PORT=$((LOCAL_PORT + 1))
           done
 
-          # Remove leading comma
-          RPC_ADDRS=${CONTAINER_PORTS:1}
           echo "RPC_ADDRS=${RPC_ADDRS}" >> $GITHUB_ENV
-          echo "✅ Dockerized Holesail tunnels established. RPC: ${RPC_ADDRS}"
-          sleep 10
+          echo "✅ All Holesail clients started. RPC: ${RPC_ADDRS}"
+          sleep 10   # give tunnels time to establish
 
-      # ---------- START LLAMA-SERVER WITH RPC (19‑WAY TENSOR SPLIT) ----------
       - name: Start llama-server with RPC and Cloudflare tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
           RPC_ADDRS: ${{ env.RPC_ADDRS }}
-          WORKER_COUNT: ${{ env.WORKER_COUNT }}
         run: |
           echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
-          echo "🧩 Tensor split: ${WORKER_COUNT}"
 
           nohup ./llama-server \
             -m model.gguf \
             --rpc ${RPC_ADDRS} \
-            --tensor-split ${WORKER_COUNT} \
-            -c 4096 \
+            --tensor-split 1,1,1,1,1 \
+            -c 2048 \
             --host 0.0.0.0 \
             --port 8080 \
             > server.log 2>&1 &
@@ -233,7 +223,6 @@ jobs:
             exit 1
           fi
 
-          # Update config.json with tunnel URL
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
@@ -250,18 +239,15 @@ jobs:
               -d "$PAYLOAD"
           fi
           echo "::notice::Frontend URL: https://$CHAT_REPO"
-
-          # Keep alive
           echo "🔄 Queen is serving. Keeping alive..."
           sleep infinity
 
-  # ---------- WORKER JOBS – 19 INSTANCES ----------
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       matrix:
-        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        instance: [1, 2, 3, 4, 5]
 
     steps:
       - name: Install dependencies
