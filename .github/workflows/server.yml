@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   # =====================================================================
-  # QUEEN JOB
+  # QUEEN JOB – Orchestrates everything
   # =====================================================================
   queen:
     runs-on: ubuntu-latest
@@ -21,34 +21,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y jq curl build-essential cmake
 
-      # ----- Clean up old worker files -----
-      - name: Clean up old worker files
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          echo "🧹 Cleaning up old worker files from previous runs..."
-          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
-
-          if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
-            echo "✅ No workers directory found – nothing to clean."
-            exit 0
-          fi
-
-          echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .path' | while read -r file; do
-            echo "  Deleting $file"
-            SHA=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/${REPO}/contents/${file}" | jq -r '.sha')
-            curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              -d "{\"message\":\"cleanup worker files\",\"sha\":\"${SHA}\"}" \
-              "https://api.github.com/repos/${REPO}/contents/${file}" > /dev/null
-          done
-          echo "✅ Cleanup complete – all old worker files removed."
-
-      # ----- Build llama-cli with RPC -----
       - name: Build llama-cli with RPC support
         run: |
           curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
@@ -60,6 +32,7 @@ jobs:
           cp bin/llama-cli ../../
           cd ../..
           chmod +x llama-cli
+          # Verify RPC support
           if ./llama-cli --help 2>&1 | grep -q rpc; then
             echo "✅ RPC support enabled"
           else
@@ -67,18 +40,17 @@ jobs:
             exit 1
           fi
 
-      # ----- Download model -----
       - name: Download model (GGUF)
         run: |
           curl -Lo model.gguf https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-distill-opus-4.5-think-q4_k_m.gguf
 
-      # ----- Wait for workers and collect URLs -----
       - name: Wait for workers and collect URLs
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "👑 Queen waiting for 5 workers..."
+          echo "👑 Queen waiting for 19 workers..."
+
           for attempt in {1..60}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -93,19 +65,19 @@ jobs:
 
             echo "  Attempt $attempt: $WORKER_COUNT workers registered"
 
-            if [ "$WORKER_COUNT" -ge 5 ]; then
+            if [ "$WORKER_COUNT" -ge 19 ]; then
               echo "✅ All workers registered!"
               break
             fi
             sleep 5
           done
 
-          if [ "$WORKER_COUNT" -lt 5 ]; then
+          if [ "$WORKER_COUNT" -lt 19 ]; then
             echo "❌ Timeout waiting for workers"
             exit 1
           fi
 
-          # Build RPC address string
+          # Build RPC connection string
           RPC_ADDRS=""
           for file in $WORKER_FILES; do
             curl -s -H "Authorization: Bearer $GH_TOKEN" \
@@ -121,7 +93,6 @@ jobs:
 
           echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
 
-      # ----- Run distributed inference -----
       - name: Run distributed inference
         run: |
           echo "🧠 Distributed inference with workers: ${RPC_ADDRS}"
@@ -131,19 +102,18 @@ jobs:
             -p "What is the meaning of life?" \
             -n 256
 
-      # ----- Keep queen alive (optional) -----
       - name: Keep queen alive
         run: sleep infinity
 
   # =====================================================================
-  # WORKER JOBS
+  # WORKER JOBS – 19 instances
   # =====================================================================
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       matrix:
-        instance: [1, 2, 3, 4, 5]
+        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
 
     steps:
       - name: Install dependencies
@@ -171,7 +141,7 @@ jobs:
           cd ../..
           chmod +x ggml-rpc-server
 
-      - name: Start RPC server and register (with conflict handling)
+      - name: Start RPC server and register
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -181,12 +151,15 @@ jobs:
 
           PORT=$((65430 + INSTANCE_ID))
 
+          # Start RPC server
           ./ggml-rpc-server -p ${PORT} &
           sleep 5
 
+          # Create bore tunnel
           bore local ${PORT} --to bore.pub > /tmp/bore_url.txt 2>&1 &
           sleep 5
 
+          # Extract bore URL
           BORE_URL=$(grep -oP 'bore\.pub:\d+' /tmp/bore_url.txt | head -1)
           if [ -z "$BORE_URL" ]; then
             echo "❌ Failed to get bore URL"
@@ -195,32 +168,23 @@ jobs:
           fi
           echo "✅ Worker $INSTANCE_ID tunnel: ${BORE_URL}"
 
-          # ----- Idempotent registration with 409 handling -----
+          # Write to workers/w<id>.json
           WORKER_FILE="workers/w${INSTANCE_ID}.json"
           mkdir -p workers
+          echo "{\"url\": \"${BORE_URL}\"}" > ${WORKER_FILE}
+          ENCODED=$(base64 -w0 ${WORKER_FILE})
 
-          # Check if already registered
-          if curl -s -f -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" > /dev/null 2>&1; then
-            echo "✅ Worker $INSTANCE_ID already registered – skipping"
+          RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d "{\"message\":\"register worker $INSTANCE_ID\",\"content\":\"${ENCODED}\"}" \
+            "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
+
+          if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
+            echo "✅ Worker $INSTANCE_ID registered successfully!"
           else
-            echo "{\"url\": \"${BORE_URL}\"}" > ${WORKER_FILE}
-            ENCODED=$(base64 -w0 ${WORKER_FILE})
-            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              -d "{\"message\":\"register worker $INSTANCE_ID\",\"content\":\"${ENCODED}\"}" \
-              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
-
-            # Check for success or 409 conflict
-            if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
-              echo "✅ Worker $INSTANCE_ID registered successfully!"
-            elif echo "$RESPONSE" | jq -e '.message' | grep -q "409"; then
-              echo "⚠️ Worker $INSTANCE_ID file already exists (409) – considered registered."
-            else
-              echo "❌ Failed to register worker $INSTANCE_ID"
-              echo "Response: $RESPONSE"
-              exit 1
-            fi
+            echo "❌ Failed to register worker $INSTANCE_ID"
+            echo "Response: $RESPONSE"
+            exit 1
           fi
 
           # Keep alive
