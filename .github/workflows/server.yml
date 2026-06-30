@@ -302,82 +302,93 @@ jobs:
           cd ../..
           chmod +x ggml-rpc-server
         
-              - name: Start RPC server and create Holesail tunnel
-          env:
-            GH_TOKEN: ${{ secrets.TOKEN }}
-            REPO: ${{ github.repository }}
-            INSTANCE_ID: ${{ matrix.instance }}
-          run: |
-            echo "🐝 Worker $INSTANCE_ID starting..."
-        
-            PORT=50052
-        
-            # Start ggml-rpc-server
-            ./ggml-rpc-server -p ${PORT} &
-            sleep 5
-        
-            # Start Holesail server – this will output a connection string
-            CONNECTION_STRING=$(holesail --live ${PORT} 2>&1 | grep -oP 'hs://[a-zA-Z0-9]+' | head -1)
-            echo "✅ Worker $INSTANCE_ID connection string: ${CONNECTION_STRING}"
-        
-            # Register the connection string in the runner repo
-            WORKER_FILE="workers/hole${INSTANCE_ID}.json"
-            mkdir -p workers
-            echo "{\"url\": \"${CONNECTION_STRING}\"}" > ${WORKER_FILE}
-            ENCODED=$(base64 -w0 ${WORKER_FILE})
-        
-            for attempt in {1..10}; do
-              echo "📝 Registration attempt $attempt for worker $INSTANCE_ID"
-        
-              FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
-              SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
-        
-              if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-                PAYLOAD=$(jq -n \
-                  --arg msg "register worker $INSTANCE_ID" \
-                  --arg content "$ENCODED" \
-                  --arg sha "$SHA" \
-                  '{message: $msg, content: $content, sha: $sha}')
-              else
-                PAYLOAD=$(jq -n \
-                  --arg msg "register worker $INSTANCE_ID" \
-                  --arg content "$ENCODED" \
-                  '{message: $msg, content: $content}')
-              fi
-        
-              RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
-                -d "$PAYLOAD")
-        
-              if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
-                echo "✅ Worker $INSTANCE_ID registered successfully!"
-                break
-              fi
-        
-              STATUS=$(echo "$RESPONSE" | jq -r '.status' 2>/dev/null)
-              if [ "$STATUS" = "409" ]; then
-                echo "⚠️ Conflict detected – retrying in 3 seconds..."
-                sleep 3
-                continue
-              fi
-        
-              echo "❌ Failed to register worker $INSTANCE_ID"
-              echo "Response: $RESPONSE"
-              exit 1
-            done
-        
-            # Keep alive
-            while true; do
-              if ! pgrep -f "ggml-rpc-server" > /dev/null; then
-                echo "⚠️ RPC server died, restarting..."
-                ./ggml-rpc-server -p ${PORT} &
-              fi
-              if ! pgrep -f "holesail" > /dev/null; then
-                echo "⚠️ Holesail server died, restarting..."
-                holesail --live ${PORT} &
-              fi
-              sleep 30
-            done
+      - name: Start RPC server and create Holesail tunnel
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+          INSTANCE_ID: ${{ matrix.instance }}
+        run: |
+          set -e
+          echo "🐝 Worker $INSTANCE_ID starting..."
+      
+          PORT=50052
+      
+          # Start ggml-rpc-server
+          ./ggml-rpc-server -p ${PORT} &
+          sleep 5
+      
+          # Start Holesail server and capture the connection string
+          echo "Starting Holesail server on port ${PORT}..."
+          holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
+          sleep 5
+      
+          # Extract the connection string
+          CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
+          if [ -z "$CONNECTION_STRING" ]; then
+            echo "❌ Failed to get connection string from Holesail"
+            cat /tmp/holesail_output.txt
+            exit 1
+          fi
+          echo "✅ Worker $INSTANCE_ID connection string: ${CONNECTION_STRING}"
+      
+          # Register the connection string in the runner repo
+          WORKER_FILE="workers/hole${INSTANCE_ID}.json"
+          mkdir -p workers
+          echo "{\"url\": \"${CONNECTION_STRING}\"}" > ${WORKER_FILE}
+          ENCODED=$(base64 -w0 ${WORKER_FILE})
+      
+          for attempt in {1..10}; do
+            echo "📝 Registration attempt $attempt for worker $INSTANCE_ID"
+      
+            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
+            SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
+      
+            if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+              PAYLOAD=$(jq -n \
+                --arg msg "register worker $INSTANCE_ID" \
+                --arg content "$ENCODED" \
+                --arg sha "$SHA" \
+                '{message: $msg, content: $content, sha: $sha}')
+            else
+              PAYLOAD=$(jq -n \
+                --arg msg "register worker $INSTANCE_ID" \
+                --arg content "$ENCODED" \
+                '{message: $msg, content: $content}')
+            fi
+      
+            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
+              -d "$PAYLOAD")
+      
+            if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
+              echo "✅ Worker $INSTANCE_ID registered successfully!"
+              break
+            fi
+      
+            STATUS=$(echo "$RESPONSE" | jq -r '.status' 2>/dev/null)
+            if [ "$STATUS" = "409" ]; then
+              echo "⚠️ Conflict detected – retrying in 3 seconds..."
+              sleep 3
+              continue
+            fi
+      
+            echo "❌ Failed to register worker $INSTANCE_ID"
+            echo "Response: $RESPONSE"
+            exit 1
+          done
+      
+          # Keep alive
+          while true; do
+            if ! pgrep -f "ggml-rpc-server" > /dev/null; then
+              echo "⚠️ RPC server died, restarting..."
+              ./ggml-rpc-server -p ${PORT} &
+            fi
+            if ! pgrep -f "holesail" > /dev/null; then
+              echo "⚠️ Holesail server died, restarting..."
+              holesail --live ${PORT} &
+            fi
+            sleep 30
+          done
