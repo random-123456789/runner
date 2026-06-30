@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # ========== STEP 1: CLEAN WORKERS DIRECTORY ==========
+      # ---------- CLEAN WORKERS DIRECTORY (Step 1) ----------
       - name: Clean workers directory (delete all files)
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -24,12 +24,10 @@ jobs:
         run: |
           echo "🧹 STEP 1: Cleaning workers directory..."
 
-          # List all files in workers/
           RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
 
-          # Delete each file individually
           echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name + ":" + .sha' 2>/dev/null | while IFS=':' read -r name sha; do
             if [ -n "$name" ] && [ -n "$sha" ]; then
               echo "  Deleting: workers/$name"
@@ -41,7 +39,7 @@ jobs:
           done
           echo "✅ Cleanup done."
 
-      # ========== STEP 2: CREATE WORKERS DIRECTORY ==========
+      # ---------- CREATE WORKERS DIRECTORY (Step 2) ----------
       - name: Create workers directory
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -49,7 +47,6 @@ jobs:
         run: |
           echo "📁 STEP 2: Creating fresh workers directory..."
 
-          # Check if .keep already exists
           RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/contents/workers/.keep" 2>/dev/null)
@@ -58,21 +55,19 @@ jobs:
           echo "" | base64 -w0 > empty_keep
 
           if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-            # Update existing file
             curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
               -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\",\"sha\":\"${SHA}\"}" || true
           else
-            # Create new file
             curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
               -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
           fi
           echo "✅ workers directory ready."
-          
-      # ---------- INSTALL DEPENDENCIES (BEFORE CLEANUP) ----------
+
+      # ---------- INSTALL DEPENDENCIES ----------
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
@@ -112,8 +107,8 @@ jobs:
             exit 1
           fi
 
-      # ---------- WAIT FOR WORKERS AND COLLECT KEYS ----------
-      - name: Wait for workers and collect Holesail keys
+      # ---------- WAIT FOR WORKERS AND COLLECT HOLESAIL URLS ----------
+      - name: Wait for workers and collect Holesail URLs
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -143,40 +138,50 @@ jobs:
             exit 1
           fi
 
-          HOLESAIL_KEYS=""
+          HOLESAIL_URLS=""
           for file in $WORKER_FILES; do
             curl -s -H "Authorization: Bearer $GH_TOKEN" \
               "https://api.github.com/repos/${REPO}/contents/workers/${file}" \
               > /tmp/worker.json
-            KEY=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.key')
-            if [ -n "$KEY" ] && [ "$KEY" != "null" ]; then
-              echo "Found key: $KEY"
-              if [ -n "$HOLESAIL_KEYS" ]; then
-                HOLESAIL_KEYS="${HOLESAIL_KEYS},${KEY}"
+            URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url')
+            if [ -n "$URL" ] && [ "$URL" != "null" ]; then
+              echo "Found URL: $URL"
+              if [ -n "$HOLESAIL_URLS" ]; then
+                HOLESAIL_URLS="${HOLESAIL_URLS},${URL}"
               else
-                HOLESAIL_KEYS="${KEY}"
+                HOLESAIL_URLS="${URL}"
               fi
             fi
           done
 
-          if [ -z "$HOLESAIL_KEYS" ]; then
-            echo "❌ No valid Holesail keys found"
+          if [ -z "$HOLESAIL_URLS" ]; then
+            echo "❌ No valid Holesail URLs found"
+            # Debug: show file contents
+            echo "Worker file contents:"
+            for file in $WORKER_FILES; do
+              echo "  $file:"
+              curl -s -H "Authorization: Bearer $GH_TOKEN" \
+                "https://api.github.com/repos/${REPO}/contents/workers/${file}" \
+                | jq -r '.content' | base64 -d
+            done
             exit 1
           fi
 
-          echo "HOLESAIL_KEYS=$HOLESAIL_KEYS" >> $GITHUB_ENV
-          echo "HOLESAIL_KEYS=${HOLESAIL_KEYS}"
+          echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
+          echo "HOLESAIL_URLS=${HOLESAIL_URLS}"
 
       # ---------- CONNECT TO WORKERS VIA HOLESAIL ----------
       - name: Connect to workers via Holesail
+        env:
+          HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
         run: |
           echo "🔗 Connecting to workers via Holesail P2P tunnels..."
 
-          IFS=',' read -ra KEYS <<< "${HOLESAIL_KEYS}"
+          IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
           PORT=50052
-          for key in "${KEYS[@]}"; do
-            echo "Connecting to worker with key: ${key} -> localhost:${PORT}"
-            holesail --connect "${key}" --listen localhost:${PORT} &
+          for url in "${URLS[@]}"; do
+            echo "Connecting to worker with URL: ${url} -> localhost:${PORT}"
+            holesail "${url}" --listen localhost:${PORT} &
             PORT=$((PORT+1))
           done
 
@@ -188,12 +193,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
-          HOLESAIL_KEYS: ${{ env.HOLESAIL_KEYS }}
+          HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
         run: |
-          IFS=',' read -ra KEYS <<< "${HOLESAIL_KEYS}"
+          # Build RPC address list
+          IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
           RPC_ADDRS=""
           PORT=50052
-          for _ in "${KEYS[@]}"; do
+          for _ in "${URLS[@]}"; do
             if [ -n "$RPC_ADDRS" ]; then
               RPC_ADDRS="${RPC_ADDRS},127.0.0.1:${PORT}"
             else
@@ -301,7 +307,7 @@ jobs:
           cp bin/ggml-rpc-server ../../
           cd ../..
           chmod +x ggml-rpc-server
-        
+
       - name: Start RPC server and create Holesail tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -310,18 +316,18 @@ jobs:
         run: |
           set -e
           echo "🐝 Worker $INSTANCE_ID starting..."
-      
+
           PORT=50052
-      
+
           # Start ggml-rpc-server
           ./ggml-rpc-server -p ${PORT} &
           sleep 5
-      
+
           # Start Holesail server and capture the connection string
           echo "Starting Holesail server on port ${PORT}..."
           holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
           sleep 5
-      
+
           # Extract the connection string
           CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
           if [ -z "$CONNECTION_STRING" ]; then
@@ -330,21 +336,21 @@ jobs:
             exit 1
           fi
           echo "✅ Worker $INSTANCE_ID connection string: ${CONNECTION_STRING}"
-      
+
           # Register the connection string in the runner repo
           WORKER_FILE="workers/hole${INSTANCE_ID}.json"
           mkdir -p workers
           echo "{\"url\": \"${CONNECTION_STRING}\"}" > ${WORKER_FILE}
           ENCODED=$(base64 -w0 ${WORKER_FILE})
-      
+
           for attempt in {1..10}; do
             echo "📝 Registration attempt $attempt for worker $INSTANCE_ID"
-      
+
             FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
             SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
-      
+
             if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
               PAYLOAD=$(jq -n \
                 --arg msg "register worker $INSTANCE_ID" \
@@ -357,29 +363,29 @@ jobs:
                 --arg content "$ENCODED" \
                 '{message: $msg, content: $content}')
             fi
-      
+
             RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
               -d "$PAYLOAD")
-      
+
             if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
               echo "✅ Worker $INSTANCE_ID registered successfully!"
               break
             fi
-      
+
             STATUS=$(echo "$RESPONSE" | jq -r '.status' 2>/dev/null)
             if [ "$STATUS" = "409" ]; then
               echo "⚠️ Conflict detected – retrying in 3 seconds..."
               sleep 3
               continue
             fi
-      
+
             echo "❌ Failed to register worker $INSTANCE_ID"
             echo "Response: $RESPONSE"
             exit 1
           done
-      
+
           # Keep alive
           while true; do
             if ! pgrep -f "ggml-rpc-server" > /dev/null; then
