@@ -227,7 +227,7 @@ jobs:
           echo "🐝 Worker $INSTANCE_ID starting..."
 
           # Poll until the Ray head connection string appears
-          for attempt in {1..30}; do
+          for attempt in {1..90}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/workers/ray_head.json")
