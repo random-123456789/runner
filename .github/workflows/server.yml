@@ -59,7 +59,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake nodejs npm openssl
+          sudo apt-get install -y jq curl build-essential cmake nodejs npm openssl netcat-openbsd
 
       - name: Install Holesail (global)
         run: sudo npm install -g holesail
@@ -141,7 +141,7 @@ jobs:
           fi
           echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
 
-      # ---------- FIX: Use `--port` to bind each client to a unique local port ----------
+      # ---------- CONNECT TO WORKERS WITH UNIQUE PORTS ----------
       - name: Connect to workers via Holesail (unique ports)
         env:
           HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
@@ -168,8 +168,33 @@ jobs:
 
           echo "RPC_ADDRS=${RPC_ADDRS}" >> $GITHUB_ENV
           echo "✅ All Holesail clients started. RPC: ${RPC_ADDRS}"
-          sleep 10   # give tunnels time to establish
 
+          # Wait for tunnels to stabilise
+          sleep 20
+
+      # ---------- VERIFY RPC PORTS ARE OPEN ----------
+      - name: Verify RPC ports
+        run: |
+          echo "🔍 Verifying RPC ports are open..."
+          for port in 60000 60001 60002 60003 60004; do
+            echo -n "Port $port: "
+            nc -zv 127.0.0.1 $port 2>&1 || echo "❌ FAILED"
+          done
+
+      # ---------- TEST INFERENCE WITH LLAMA-CLI ----------
+      - name: Test inference with llama-cli
+        env:
+          RPC_ADDRS: ${{ env.RPC_ADDRS }}
+        run: |
+          echo "🧪 Testing llama-cli with RPC workers..."
+          ./llama-cli -m model.gguf \
+            --rpc ${RPC_ADDRS} \
+            --tensor-split 5 \
+            -p "Hello" \
+            -n 20 2>&1 | head -50
+          echo "=== Test finished ==="
+
+      # ---------- START LLAMA-SERVER ----------
       - name: Start llama-server with RPC and Cloudflare tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -187,6 +212,7 @@ jobs:
             --port 8080 \
             > server.log 2>&1 &
 
+          # Wait for server to be ready
           for i in {1..20}; do
             if curl -s http://localhost:8080/health > /dev/null; then
               echo "✅ llama-server is ready"
@@ -200,6 +226,16 @@ jobs:
             cat server.log
             exit 1
           fi
+
+          # Test the API endpoint
+          echo "📡 Testing /v1/chat/completions endpoint..."
+          curl -X POST http://localhost:8080/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "distributed-model",
+              "messages": [{"role": "user", "content": "Hello"}],
+              "stream": false
+            }' 2>&1 | head -20
 
           echo "🌐 Starting Cloudflare tunnel..."
           if [ ! -f ./cloudflared ]; then
@@ -223,6 +259,7 @@ jobs:
             exit 1
           fi
 
+          # Update config.json in chat repo
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
