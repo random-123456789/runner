@@ -19,10 +19,29 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake nodejs npm
+          sudo apt-get install -y jq curl build-essential cmake nodejs npm openssl
 
       - name: Install Holesail (global)
         run: sudo npm install -g holesail
+
+      # ---------- CLEAN WORKERS DIRECTORY ----------
+      - name: Clean and recreate workers directory
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "🧹 Cleaning workers directory..."
+          curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${REPO}/contents/workers" \
+            -d '{"message":"cleanup","sha":""}' 2>/dev/null || true
+          echo "✅ Cleanup done."
+          echo "📁 Creating fresh workers directory..."
+          echo "" | base64 -w0 > empty_keep
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
+            -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
+          echo "✅ workers directory ready."
 
       - name: Build llama-server with RPC support
         run: |
@@ -53,24 +72,7 @@ jobs:
             exit 1
           fi
 
-      - name: Clean and recreate workers directory
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          echo "🧹 Cleaning workers directory..."
-          curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${REPO}/contents/workers" \
-            -d '{"message":"cleanup","sha":""}' 2>/dev/null || true
-          echo "✅ Cleanup done."
-          echo "📁 Creating fresh workers directory..."
-          echo "" | base64 -w0 > empty_keep
-          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
-            -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
-          echo "✅ workers directory ready."
-
+      # ---------- WAIT FOR WORKERS AND COLLECT KEYS ----------
       - name: Wait for workers and collect Holesail keys
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -101,31 +103,37 @@ jobs:
             exit 1
           fi
 
-          # Read Holesail keys from worker files
           HOLESAIL_KEYS=""
           for file in $WORKER_FILES; do
             curl -s -H "Authorization: Bearer $GH_TOKEN" \
               "https://api.github.com/repos/${REPO}/contents/workers/${file}" \
               > /tmp/worker.json
             KEY=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.key')
-            if [ -n "$HOLESAIL_KEYS" ]; then
-              HOLESAIL_KEYS="${HOLESAIL_KEYS},${KEY}"
+            if [ -n "$KEY" ] && [ "$KEY" != "null" ]; then
+              echo "Found key: $KEY"
+              if [ -n "$HOLESAIL_KEYS" ]; then
+                HOLESAIL_KEYS="${HOLESAIL_KEYS},${KEY}"
+              else
+                HOLESAIL_KEYS="${KEY}"
+              fi
             else
-              HOLESAIL_KEYS="${KEY}"
+              echo "⚠️ Skipping empty key for file: $file"
             fi
           done
+
+          if [ -z "$HOLESAIL_KEYS" ]; then
+            echo "❌ No valid Holesail keys found"
+            exit 1
+          fi
 
           echo "HOLESAIL_KEYS=$HOLESAIL_KEYS" >> $GITHUB_ENV
           echo "HOLESAIL_KEYS=${HOLESAIL_KEYS}"
 
-      # -----------------------------------------------------------------
-      # 🔗 Connect to each worker via Holesail and forward to local ports
-      # -----------------------------------------------------------------
+      # ---------- CONNECT TO WORKERS VIA HOLESAIL ----------
       - name: Connect to workers via Holesail
         run: |
           echo "🔗 Connecting to workers via Holesail P2P tunnels..."
 
-          # Split HOLESAIL_KEYS into array
           IFS=',' read -ra KEYS <<< "${HOLESAIL_KEYS}"
           PORT=50052
           for key in "${KEYS[@]}"; do
@@ -135,14 +143,14 @@ jobs:
           done
 
           # Wait for connections to establish
-          sleep 10
+          sleep 15
           echo "✅ Holesail tunnels established."
 
-      # -----------------------------------------------------------------
-      # 🚀 Start llama-server with RPC workers
-      # -----------------------------------------------------------------
-      - name: Start llama-server with RPC
+      # ---------- START LLAMA-SERVER WITH RPC ----------
+      - name: Start llama-server with RPC and Cloudflare tunnel
         env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO_OWNER: ${{ github.repository_owner }}
           HOLESAIL_KEYS: ${{ env.HOLESAIL_KEYS }}
         run: |
           # Build RPC address list (localhost:50052, localhost:50053, ...)
@@ -185,8 +193,11 @@ jobs:
           fi
 
           # Start Cloudflare tunnel to port 8080
-          curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x cloudflared
+          echo "🌐 Starting Cloudflare tunnel..."
+          if [ ! -f ./cloudflared ]; then
+            curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+            chmod +x cloudflared
+          fi
           nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
 
           # Extract tunnel URL
@@ -242,7 +253,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake nodejs npm
+          sudo apt-get install -y jq curl build-essential cmake nodejs npm openssl
 
       - name: Install Holesail (global)
         run: sudo npm install -g holesail
@@ -273,14 +284,13 @@ jobs:
           ./ggml-rpc-server -p ${PORT} &
           sleep 5
 
-          # Generate a random Holesail key (or use instance ID)
-          KEY="worker${INSTANCE_ID}-$(uuidgen || cat /proc/sys/kernel/random/uuid)"
+          # Generate a valid base32 Holesail key (only A-Z and 2-7)
+          KEY=$(openssl rand -base32 16)
+          echo "✅ Worker $INSTANCE_ID generated key: ${KEY}"
 
           # Create Holesail tunnel that exposes the RPC server
           holesail --listen localhost:${PORT} --key ${KEY} &
           sleep 5
-
-          echo "✅ Worker $INSTANCE_ID tunnel created with key: ${KEY}"
 
           # Register the Holesail key in the runner repo
           WORKER_FILE="workers/hole${INSTANCE_ID}.json"
