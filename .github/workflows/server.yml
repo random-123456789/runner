@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   # =====================================================================
-  # QUEEN JOB – Orchestrates everything
+  # QUEEN JOB
   # =====================================================================
   queen:
     runs-on: ubuntu-latest
@@ -32,7 +32,6 @@ jobs:
           cp bin/llama-cli ../../
           cd ../..
           chmod +x llama-cli
-          # Verify RPC support
           if ./llama-cli --help 2>&1 | grep -q rpc; then
             echo "✅ RPC support enabled"
           else
@@ -50,8 +49,6 @@ jobs:
             ls -lh model.gguf
           else
             echo "❌ Invalid GGUF file – first 4 bytes: $(head -c 4 model.gguf)"
-            echo "File content (first 200 bytes):"
-            head -c 200 model.gguf
             exit 1
           fi
 
@@ -109,7 +106,7 @@ jobs:
         run: sleep infinity
 
   # =====================================================================
-  # WORKER JOBS – 5 instances (change to 19 for full deployment)
+  # WORKER JOBS
   # =====================================================================
   worker:
     runs-on: ubuntu-latest
@@ -154,15 +151,12 @@ jobs:
 
           PORT=$((65430 + INSTANCE_ID))
 
-          # Start RPC server
           ./ggml-rpc-server -p ${PORT} &
           sleep 5
 
-          # Create bore tunnel
           bore local ${PORT} --to bore.pub > /tmp/bore_url.txt 2>&1 &
           sleep 5
 
-          # Extract bore URL
           BORE_URL=$(grep -oP 'bore\.pub:\d+' /tmp/bore_url.txt | head -1)
           if [ -z "$BORE_URL" ]; then
             echo "❌ Failed to get bore URL"
@@ -171,7 +165,7 @@ jobs:
           fi
           echo "✅ Worker $INSTANCE_ID tunnel: ${BORE_URL}"
 
-          # Write to workers/w<id>.json
+          # Direct write – each worker writes its own file
           WORKER_FILE="workers/w${INSTANCE_ID}.json"
           mkdir -p workers
           echo "{\"url\": \"${BORE_URL}\"}" > ${WORKER_FILE}
