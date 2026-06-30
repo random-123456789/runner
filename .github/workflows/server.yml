@@ -1,396 +1,128 @@
-name: P2P Inference Swarm (Request-Routing)
+# p2p-layer-mesh.yaml
+# ============================================================================
+# P2P Layer Mesh - Distributed LLM Inference over Peer-to-Peer Network
+# ============================================================================
 
-on:
-  workflow_dispatch:
+version: "1.0"
+metadata:
+  name: "p2p-layer-mesh"
+  description: "Decentralized LLM inference with layer-aware sharding and proximity routing"
 
-permissions:
-  actions: write
-  contents: write
+# ----------------------------------------------------------------------------
+# Model Definition
+# ----------------------------------------------------------------------------
+model:
+  source: "https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF"
+  file: "granite-4.0-h-tiny-distill-opus-4.5-think-q4_k_m.gguf"
+  total_layers: 40               # Total layers in the model
+  context_length: 4096
 
-env:
-  # Known-good small model. Once this works, swap in your Granite GGUF.
-  MODEL_URL: "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+# ----------------------------------------------------------------------------
+# Layer Sharding Strategy
+# ----------------------------------------------------------------------------
+sharding:
+  strategy: "contiguous"         # Each node gets a contiguous block of layers
+  # Alternative: "interleaved"   # Layers are distributed round-robin
+  # Alternative: "dynamic"       # Layers are allocated based on node capacity
 
-jobs:
+# ----------------------------------------------------------------------------
+# Network Topology
+# ----------------------------------------------------------------------------
+network:
+  protocol: "libp2p"              # Peer-to-peer networking stack
+  discovery: "mdns"               # Local network discovery (mdns / bootstrap)
+  bootstrap_peers:                # Optional: static bootstrap nodes
+    - "/ip4/192.168.1.100/tcp/9001/p2p/Qm..."
+    - "/ip4/192.168.1.101/tcp/9001/p2p/Qm..."
+  nat_traversal: true             # Enable NAT traversal (hole punching)
+  relay: true                     # Use relay nodes when direct connection fails
 
-  bootstrap:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Ensure workers registry exists
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -e
-          EMPTY=$(printf '' | base64 -w0)
-          curl -s -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/workers/.keep" > /tmp/keep.json || true
-          SHA=$(jq -r '.sha // empty' /tmp/keep.json)
-          if [ -n "$SHA" ]; then
-            curl -s -X PUT -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
-              -d "{\"message\":\"ensure workers dir\",\"content\":\"$EMPTY\",\"sha\":\"$SHA\"}" || true
-          else
-            curl -s -X PUT -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
-              -d "{\"message\":\"create workers dir\",\"content\":\"$EMPTY\"}" || true
-          fi
+# ----------------------------------------------------------------------------
+# Routing & Scheduling
+# ----------------------------------------------------------------------------
+routing:
+  # Each node maintains a DHT with peer latency and layer range
+  discovery_interval: 30          # Seconds between DHT refresh
+  latency_threshold: 50           # Maximum acceptable RTT in milliseconds
+  fallback_strategy: "random"     # If preferred peer unavailable
 
-  worker:
-    needs: bootstrap
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    strategy:
-      matrix:
-        instance: [1, 2, 3, 4, 5]
+# ----------------------------------------------------------------------------
+# Nodes (Peer List)
+# ----------------------------------------------------------------------------
+nodes:
+  # Each node is defined by its layer range and connection details
+  - id: "node-1"
+    role: "worker"
+    layers: [0, 9]                # Layers 0 through 9
+    listen_addr: "/ip4/0.0.0.0/tcp/9001"
+    resources:
+      cpu: 4
+      memory_gb: 16
+    # Optional: hardware capabilities
+    accelerator: "cpu"            # "cpu" | "cuda" | "metal"
 
-    steps:
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake git nodejs npm openssl psmisc netcat-traditional
+  - id: "node-2"
+    role: "worker"
+    layers: [10, 19]
+    listen_addr: "/ip4/0.0.0.0/tcp/9002"
+    resources:
+      cpu: 4
+      memory_gb: 16
+    accelerator: "cpu"
 
-      - name: Install Holesail
-        run: sudo npm install -g holesail
+  - id: "node-3"
+    role: "worker"
+    layers: [20, 29]
+    listen_addr: "/ip4/0.0.0.0/tcp/9003"
+    resources:
+      cpu: 4
+      memory_gb: 16
+    accelerator: "cpu"
 
-      - name: Build llama-server
-        run: |
-          set -e
-          curl -Lo llama.cpp.zip "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b9850.zip"
-          unzip -q llama.cpp.zip
-          cd llama.cpp-b9850
-          mkdir -p build && cd build
-          cmake .. -DGGML_RPC=OFF -DGGML_CUDA=OFF -DGGML_METAL=OFF
-          cmake --build . --config Release -j4 --target llama-server
-          cp bin/llama-server ../../
-          cd ../..
+  - id: "node-4"
+    role: "worker"
+    layers: [30, 39]
+    listen_addr: "/ip4/0.0.0.0/tcp/9004"
+    resources:
+      cpu: 4
+      memory_gb: 16
+    accelerator: "cpu"
 
-      - name: Download model
-        run: |
-          curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
-          [ "$(head -c 4 model.gguf)" = "GGUF" ] || { echo "❌ Invalid GGUF"; exit 1; }
+# ----------------------------------------------------------------------------
+# Runtime Parameters
+# ----------------------------------------------------------------------------
+runtime:
+  inference:
+    max_tokens: 256
+    temperature: 0.7
+    top_p: 0.9
+    stream: true
 
-      - name: Start llama-server and Holesail server
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-          INSTANCE_ID: ${{ matrix.instance }}
-        run: |
-          set -e
-          PORT=50052
-          mkdir -p logs
+  health:
+    check_interval: 10            # Seconds between health checks
+    timeout: 30                   # Seconds before marking a peer as dead
 
-          echo "🐝 Worker $INSTANCE_ID starting llama-server..."
-          nohup ./llama-server \
-            -m model.gguf \
-            --port ${PORT} \
-            --host 127.0.0.1 \
-            -c 2048 \
-            -np 2 \
-            --timeout 120 \
-            > logs/llama.log 2>&1 &
+  logging:
+    level: "info"                 # debug | info | warn | error
+    format: "json"
 
-          for i in $(seq 1 30); do
-            if curl -fs --max-time 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
-              echo "✅ llama-server healthy on port ${PORT}"
-              break
-            fi
-            if ! pgrep -f "llama-server" >/dev/null; then
-              echo "❌ llama-server died"
-              cat logs/llama.log
-              exit 1
-            fi
-            sleep 1
-          done
+# ----------------------------------------------------------------------------
+# Security
+# ----------------------------------------------------------------------------
+security:
+  encryption: "tls"               # Transport encryption
+  authentication: "peer-id"       # Each node is identified by its libp2p PeerID
+  # Optional: require a shared secret for joining the mesh
+  # shared_secret: "your-secret-key"
 
-          echo "🔗 Starting Holesail server on port ${PORT}..."
-          rm -f /tmp/holesail_output.txt
-          holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
-          sleep 10
-
-          CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
-          if [ -z "${CONNECTION_STRING}" ]; then
-            echo "❌ Failed to get Holesail connection string"
-            cat /tmp/holesail_output.txt
-            exit 1
-          fi
-          echo "✅ Worker $INSTANCE_ID connection string: ${CONNECTION_STRING}"
-
-          register_worker() {
-            local url="$1"
-            local file="workers/hole${INSTANCE_ID}.json"
-            mkdir -p workers
-            echo "{\"url\":\"${url}\",\"ts\":$(date +%s)}" > "${file}"
-            ENCODED=$(base64 -w0 "${file}")
-
-            for attempt in $(seq 1 15); do
-              local info sha payload response status
-              info=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO}/contents/${file}") || true
-              sha=$(echo "$info" | jq -r '.sha // empty' 2>/dev/null)
-
-              if [ -n "$sha" ]; then
-                payload=$(jq -n --arg msg "worker ${INSTANCE_ID} update" \
-                  --arg content "$ENCODED" --arg sha "$sha" \
-                  '{message:$msg,content:$content,sha:$sha}')
-              else
-                payload=$(jq -n --arg msg "worker ${INSTANCE_ID} register" \
-                  --arg content "$ENCODED" \
-                  '{message:$msg,content:$content}')
-              fi
-
-              response=$(curl -s -X PUT -H "Authorization: Bearer ${GH_TOKEN}" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO}/contents/${file}" \
-                -d "$payload") || true
-
-              if echo "$response" | jq -e '.content' >/dev/null 2>&1; then
-                echo "✅ Worker $INSTANCE_ID registered"
-                return 0
-              fi
-
-              status=$(echo "$response" | jq -r '.status // empty' 2>/dev/null)
-              if [ "$status" = "409" ]; then
-                echo "⚠️ Conflict, retrying..."
-                sleep 3
-                continue
-              fi
-              echo "❌ Registration failed: $response"
-              return 1
-            done
-          }
-
-          register_worker "${CONNECTION_STRING}"
-
-          LAST_KEY="${CONNECTION_STRING}"
-          while true; do
-            sleep 30
-
-            if ! pgrep -f "llama-server" >/dev/null; then
-              echo "⚠️ llama-server died — restarting..."
-              nohup ./llama-server \
-                -m model.gguf \
-                --port ${PORT} \
-                --host 127.0.0.1 \
-                -c 2048 \
-                -np 2 \
-                --timeout 120 \
-                > logs/llama.log 2>&1 &
-              sleep 5
-            fi
-
-            if ! pgrep -f "holesail --live ${PORT}" >/dev/null; then
-              echo "⚠️ Holesail died — restarting..."
-              rm -f /tmp/holesail_output.txt
-              holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
-              sleep 10
-              CURRENT_KEY=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1 || true)
-              if [ -n "$CURRENT_KEY" ] && [ "$CURRENT_KEY" != "$LAST_KEY" ]; then
-                echo "🔄 Key changed, re-registering..."
-                register_worker "$CURRENT_KEY"
-                LAST_KEY="$CURRENT_KEY"
-              fi
-            fi
-          done
-
-  queen:
-    needs: bootstrap
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-
-    steps:
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake git nodejs npm nginx netcat-traditional
-
-      - name: Install Holesail
-        run: sudo npm install -g holesail
-
-      - name: Build llama-server
-        run: |
-          set -e
-          curl -Lo llama.cpp.zip "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b9850.zip"
-          unzip -q llama.cpp.zip
-          cd llama.cpp-b9850
-          mkdir -p build && cd build
-          cmake .. -DGGML_RPC=OFF -DGGML_CUDA=OFF -DGGML_METAL=OFF
-          cmake --build . --config Release -j4 --target llama-server
-          cp bin/llama-server ../../
-          cd ../..
-
-      - name: Download model
-        run: |
-          curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
-          [ "$(head -c 4 model.gguf)" = "GGUF" ] || { echo "❌ Invalid GGUF"; exit 1; }
-
-      - name: Wait for workers and collect Holesail URLs
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-          EXPECTED: "5"
-        run: |
-          set -e
-          for attempt in $(seq 1 60); do
-            RESPONSE=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null || true)
-            FILES=$(echo "$RESPONSE" | jq -r '.[]? | select(.type=="file" and (.name | startswith("hole"))) | .name' 2>/dev/null || true)
-            COUNT=$(echo "$FILES" | grep -c . || echo 0)
-            echo "  Attempt $attempt: $COUNT / ${EXPECTED} workers"
-            [ "$COUNT" -ge "${EXPECTED}" ] && break
-            sleep 5
-          done
-          [ "$COUNT" -ge "${EXPECTED}" ] || { echo "❌ Timeout waiting for workers"; exit 1; }
-
-          URLS=""
-          for f in $FILES; do
-            U=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" \
-                 -H "Accept: application/vnd.github+json" \
-                 "https://api.github.com/repos/${REPO}/contents/workers/$f" | \
-                jq -r '.content' | base64 -d | jq -r '.url' 2>/dev/null)
-            [ -n "$U" ] && [ "$U" != "null" ] || continue
-            [ -z "$URLS" ] && URLS="$U" || URLS="$URLS,$U"
-          done
-          [ -n "$URLS" ] || { echo "❌ No valid worker URLs"; exit 1; }
-          echo "HOLESAIL_URLS=$URLS" >> $GITHUB_ENV
-
-      - name: Open Holesail clients and configure Nginx
-        env:
-          HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
-        run: |
-          set -e
-          mkdir -p logs
-          IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
-
-          BASE=60000
-          UPSTREAM=""
-          i=0
-          for url in "${URLS[@]}"; do
-            port=$((BASE + i))
-            echo "🔗 Holesail client $i: $url → 127.0.0.1:$port"
-            nohup holesail "$url" --port $port > logs/holesail_$i.log 2>&1 &
-
-            for t in $(seq 1 50); do
-              nc -z 127.0.0.1 $port && break
-              sleep 1
-            done
-
-            if ! nc -z 127.0.0.1 $port; then
-              echo "❌ Holesail client $i did not open port $port"
-              cat logs/holesail_$i.log
-              exit 1
-            fi
-
-            # Also ensure the upstream llama-server responds through the tunnel.
-            for t in $(seq 1 30); do
-              if curl -fs --max-time 3 "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
-                echo "  ✅ llama-server reachable via port $port"
-                break
-              fi
-              sleep 1
-            done
-
-            UPSTREAM="${UPSTREAM}    server 127.0.0.1:$port max_fails=2 fail_timeout=15s;\n"
-            i=$((i + 1))
-          done
-
-          echo "🚀 Configuring Nginx..."
-          sudo tee /etc/nginx/sites-available/default > /dev/null <<EOF
-          upstream llama_swarm {
-              least_conn;
-          ${UPSTREAM}
-          }
-
-          server {
-              listen 8080 default_server;
-              access_log /var/log/nginx/queen_access.log;
-              error_log /var/log/nginx/queen_error.log;
-
-              proxy_connect_timeout 10s;
-              proxy_send_timeout 120s;
-              proxy_read_timeout 120s;
-
-              location / {
-                  proxy_pass http://llama_swarm;
-                  proxy_http_version 1.1;
-                  proxy_set_header Host \$host;
-                  proxy_set_header X-Real-IP \$remote_addr;
-                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-                  proxy_buffering off;
-              }
-          }
-          EOF
-
-          sudo nginx -t
-          sudo systemctl restart nginx || sudo nginx -s reload || sudo service nginx restart
-          echo "✅ Nginx listening on port 8080"
-
-          # Wait for Nginx to pass requests through.
-          for i in $(seq 1 20); do
-            if curl -fs --max-time 3 http://localhost:8080/health >/dev/null 2>&1; then
-              echo "✅ Nginx health check passed"
-              break
-            fi
-            sleep 1
-          done
-
-      - name: Start Cloudflare tunnel
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-        run: |
-          set -e
-          if [ ! -f ./cloudflared ]; then
-            curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-            chmod +x cloudflared
-          fi
-
-          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > logs/tunnel.log 2>&1 &
-
-          TUNNEL_URL=""
-          for i in $(seq 1 30); do
-            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' logs/tunnel.log | head -1 || true)
-            [ -n "$TUNNEL_URL" ] && break
-            sleep 3
-          done
-
-          [ -n "$TUNNEL_URL" ] || {
-            echo "❌ Failed to get tunnel URL"
-            tail -100 logs/tunnel.log
-            exit 1
-          }
-
-          echo "✅ Tunnel URL: $TUNNEL_URL"
-          echo "::notice::Public API: $TUNNEL_URL"
-          echo "::notice::Chat completions: $TUNNEL_URL/v1/chat/completions"
-
-          CHAT_REPO="${{ github.repository_owner }}/chat"
-          CFG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl:$url}')
-          ENC=$(echo "$CFG" | base64 -w0)
-          INFO=$(curl -s -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" || true)
-          SHA=$(echo "$INFO" | jq -r '.sha // empty' 2>/dev/null || true)
-          if [ -n "$SHA" ]; then
-            PAYLOAD=$(jq -n --arg msg "update API URL" --arg content "$ENC" --arg sha "$SHA" \
-              '{message:$msg,content:$content,sha:$sha}')
-            curl -s -X PUT -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" -d "$PAYLOAD"
-          fi
-
-      - name: Keep alive and monitor
-        run: |
-          while pgrep -x nginx >/dev/null; do
-            if ! curl -fs --max-time 5 http://localhost:8080/health >/dev/null 2>&1; then
-              echo "⚠️ Nginx/health check failed at $(date -Iseconds)"
-              tail -50 /var/log/nginx/queen_error.log 2>/dev/null || true
-            fi
-            sleep 30
-          done
-          echo "❌ Nginx died"
-          exit 1
+# ----------------------------------------------------------------------------
+# Monitoring (Optional)
+# ----------------------------------------------------------------------------
+monitoring:
+  prometheus:
+    enabled: true
+    port: 9090
+  metrics:
+    - "inference_latency_ms"
+    - "tokens_per_second"
+    - "layer_transfer_bytes"
