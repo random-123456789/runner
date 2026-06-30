@@ -140,56 +140,42 @@ jobs:
             exit 1
           fi
           echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
-          echo "HOLESAIL_URLS=${HOLESAIL_URLS}"
 
-      # ---------- NOVEL TECHNIQUE: Socat Port Proxy ----------
-      - name: Connect to workers via Holesail + socat proxy
+      # ---------- FIX: Use `--port` to bind each client to a unique local port ----------
+      - name: Connect to workers via Holesail (unique ports)
         env:
           HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
         run: |
-          echo "🔗 Connecting to workers via Holesail P2P tunnels with socat proxy..."
-
-          # Install socat
-          sudo apt-get install -y socat
+          echo "🔗 Connecting to workers via Holesail P2P tunnels..."
 
           IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
           LOCAL_PORT=60000
-          for url in "${URLS[@]}"; do
-            echo "Connecting to worker with URL: ${url}"
-
-            # Start Holesail client (defaults to port 50052)
-            holesail "${url}" &
-            sleep 2
-
-            # Forward unique port → 50052 using socat
-            socat TCP-LISTEN:${LOCAL_PORT},fork TCP:127.0.0.1:50052 &
-            echo "  ✅ Forwarding localhost:${LOCAL_PORT} → localhost:50052"
-
-            LOCAL_PORT=$((LOCAL_PORT + 1))
-          done
-
-          sleep 15
-          echo "✅ Holesail tunnels established with socat proxies."
-
-      # ---------- LLAMA-SERVER WITH RPC ----------
-      - name: Start llama-server with RPC and Cloudflare tunnel
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO_OWNER: ${{ github.repository_owner }}
-          HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
-        run: |
-          IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
           RPC_ADDRS=""
-          LOCAL_PORT=60000
-          for _ in "${URLS[@]}"; do
+
+          for url in "${URLS[@]}"; do
+            echo "Connecting worker ${url} → localhost:${LOCAL_PORT}"
+            # Use --port to force client to listen on a specific local port
+            holesail "${url}" --port ${LOCAL_PORT} &
+
             if [ -n "$RPC_ADDRS" ]; then
               RPC_ADDRS="${RPC_ADDRS},127.0.0.1:${LOCAL_PORT}"
             else
               RPC_ADDRS="127.0.0.1:${LOCAL_PORT}"
             fi
+
             LOCAL_PORT=$((LOCAL_PORT + 1))
           done
 
+          echo "RPC_ADDRS=${RPC_ADDRS}" >> $GITHUB_ENV
+          echo "✅ All Holesail clients started. RPC: ${RPC_ADDRS}"
+          sleep 10   # give tunnels time to establish
+
+      - name: Start llama-server with RPC and Cloudflare tunnel
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          RPC_ADDRS: ${{ env.RPC_ADDRS }}
+        run: |
           echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
 
           nohup ./llama-server \
