@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   # =====================================================================
-  # QUEEN JOB – Orchestrates everything + serves API
+  # QUEEN JOB – Orchestrates everything + serves llama-server
   # =====================================================================
   queen:
     runs-on: ubuntu-latest
@@ -39,21 +39,21 @@ jobs:
             -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
           echo "✅ workers directory ready."
 
-      - name: Build llama-cli with RPC support
+      - name: Build llama-cli and llama-server with RPC support
         run: |
           curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
           unzip -q llama.cpp.zip
           cd llama.cpp-master
           mkdir build && cd build
           cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
-          cmake --build . --config Release -j4 --target llama-cli
-          cp bin/llama-cli ../../
+          cmake --build . --config Release -j4 --target llama-cli --target llama-server
+          cp bin/llama-cli bin/llama-server ../../
           cd ../..
-          chmod +x llama-cli
-          if ./llama-cli --help 2>&1 | grep -q rpc; then
-            echo "✅ RPC support enabled"
+          chmod +x llama-cli llama-server
+          if ./llama-server --help 2>&1 | grep -q rpc; then
+            echo "✅ llama-server RPC support enabled"
           else
-            echo "❌ RPC support missing"
+            echo "❌ llama-server RPC support missing"
             exit 1
           fi
 
@@ -113,146 +113,69 @@ jobs:
           echo "RPC_ADDRS=${RPC_ADDRS}"
 
       # -----------------------------------------------------------------
-      # 🔍 DEBUG: Test llama-cli directly BEFORE starting the API server
+      # 🔍 DEBUG: Test llama-server with RPC directly
       # -----------------------------------------------------------------
-      - name: Debug llama-cli (manual test)
+      - name: Debug llama-server (manual test)
         run: |
-          echo "🧪 Testing llama-cli with RPC workers..."
+          echo "🧪 Testing llama-server with RPC workers..."
           echo "RPC_ADDRS: ${RPC_ADDRS}"
-          echo "Running: ./llama-cli -m model.gguf --rpc ${RPC_ADDRS} --tensor-split 10 -p 'Hello' -n 20 --stream"
-          ./llama-cli -m model.gguf \
+          echo "Starting llama-server in debug mode..."
+          timeout 10 ./llama-server \
+            -m model.gguf \
             --rpc ${RPC_ADDRS} \
             --tensor-split 10 \
-            -p "Hello" \
-            -n 20 \
-            --stream 2>&1 | head -100
+            -c 4096 \
+            --host 0.0.0.0 \
+            --port 8080 \
+            2>&1 | head -50 || true
           echo "=== Debug test finished ==="
 
       # -----------------------------------------------------------------
-      # 🚀 Start API server and Cloudflare tunnel
+      # 🚀 Start llama-server and Cloudflare tunnel
       # -----------------------------------------------------------------
-      - name: Start API server and Cloudflare tunnel
+      - name: Start llama-server and Cloudflare tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
           RPC_ADDRS: ${{ env.RPC_ADDRS }}
         run: |
-          # 1. Write the Ollama‑compatible API server (with stderr capture)
-          cat > server.py << 'EOF'
-          import subprocess
-          import json
-          import os
-          import sys
-          from http.server import HTTPServer, BaseHTTPRequestHandler
+          echo "🌐 Starting llama-server with RPC workers..."
+          echo "RPC_ADDRS: ${RPC_ADDRS}"
 
-          RPC_ADDRS = os.environ.get('RPC_ADDRS', '')
+          # Start llama-server with RPC
+          nohup ./llama-server \
+            -m model.gguf \
+            --rpc ${RPC_ADDRS} \
+            --tensor-split 10 \
+            -c 4096 \
+            --host 0.0.0.0 \
+            --port 8080 \
+            > server.log 2>&1 &
 
-          class OllamaHandler(BaseHTTPRequestHandler):
-              def do_GET(self):
-                  if self.path == '/api/tags':
-                      self.send_response(200)
-                      self.send_header('Content-Type', 'application/json')
-                      self.end_headers()
-                      response = {"models": [{"name": "distributed-model", "modified_at": "2026-01-01T00:00:00Z", "size": 0}]}
-                      self.wfile.write(json.dumps(response).encode())
-                  else:
-                      self.send_response(404)
-                      self.end_headers()
-
-              def do_POST(self):
-                  if self.path == '/api/generate':
-                      content_length = int(self.headers.get('Content-Length', 0))
-                      body = self.rfile.read(content_length)
-                      try:
-                          data = json.loads(body)
-                          prompt = data.get('prompt', '')
-                      except:
-                          prompt = ''
-
-                      self.send_response(200)
-                      self.send_header('Content-Type', 'text/event-stream')
-                      self.send_header('Cache-Control', 'no-cache')
-                      self.end_headers()
-
-                      # Build command
-                      cmd = [
-                          './llama-cli', '-m', 'model.gguf',
-                          '--rpc', RPC_ADDRS,
-                          '--tensor-split', '10',
-                          '-p', prompt,
-                          '-n', '256',
-                          '--stream'
-                      ]
-                      # Log the command for debugging
-                      sys.stderr.write(f"Running: {' '.join(cmd)}\n")
-                      sys.stderr.flush()
-
-                      # Start process
-                      process = subprocess.Popen(
-                          cmd,
-                          stdout=subprocess.PIPE,
-                          stderr=subprocess.PIPE,
-                          text=True,
-                          bufsize=1  # line buffered
-                      )
-
-                      # Read stdout line by line
-                      for line in process.stdout:
-                          if line.strip():
-                              self.wfile.write(f"data: {json.dumps({'response': line.strip()})}\n\n".encode())
-                              self.wfile.flush()
-
-                      # Check for errors
-                      stderr_output = process.stderr.read()
-                      if stderr_output:
-                          sys.stderr.write(f"stderr: {stderr_output}\n")
-                          sys.stderr.flush()
-                          # Optionally send error to client
-                          self.wfile.write(f"data: {json.dumps({'error': stderr_output.strip()})}\n\n".encode())
-
-                      self.wfile.write(b"data: [DONE]\n\n")
-                  else:
-                      self.send_response(404)
-                      self.end_headers()
-
-              def log_message(self, format, *args):
-                  pass
-
-          if __name__ == '__main__':
-              server = HTTPServer(('0.0.0.0', 8000), OllamaHandler)
-              sys.stderr.write("✅ Ollama-compatible API server running on port 8000\n")
-              sys.stderr.flush()
-              server.serve_forever()
-          EOF
-
-          # 2. Start the API server with nohup (detached)
-          nohup python3 server.py > server.log 2>&1 &
-          echo "🔄 API server starting..."
-
-          # 3. Wait for server to be ready
+          # Wait for server to be ready
           for i in {1..20}; do
-            if curl -s http://localhost:8000/api/tags > /dev/null; then
-              echo "✅ API server is ready"
+            if curl -s http://localhost:8080/health > /dev/null; then
+              echo "✅ llama-server is ready"
               break
             fi
-            echo "⏳ Waiting for API server... ($i/20)"
+            echo "⏳ Waiting for llama-server... ($i/20)"
             sleep 2
           done
-          if ! curl -s http://localhost:8000/api/tags > /dev/null; then
-            echo "❌ API server failed to start"
+          if ! curl -s http://localhost:8080/health > /dev/null; then
+            echo "❌ llama-server failed to start"
             cat server.log
             exit 1
           fi
 
-          # 4. Start Cloudflare tunnel to port 8000
+          # Start Cloudflare tunnel to port 8080
           echo "🌐 Starting Cloudflare tunnel..."
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x cloudflared
           fi
-          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8000 > tunnel.log 2>&1 &
+          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
 
-          # 5. Extract tunnel URL
+          # Extract tunnel URL
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$TUNNEL_URL" ]; then
@@ -269,7 +192,7 @@ jobs:
             exit 1
           fi
 
-          # 6. Update config.json in the chat repo
+          # Update config.json in the chat repo
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
@@ -287,7 +210,7 @@ jobs:
           fi
           echo "::notice::Frontend URL: https://$CHAT_REPO"
 
-          # 7. Keep alive
+          # Keep alive
           echo "🔄 Queen is serving. Keeping alive..."
           sleep infinity
 
@@ -362,7 +285,6 @@ jobs:
           echo "{\"url\": \"${BORE_URL}\"}" > ${WORKER_FILE}
           ENCODED=$(base64 -w0 ${WORKER_FILE})
 
-          # ---------- Retry loop (handle 409 conflict) ----------
           for attempt in {1..10}; do
             echo "📝 Registration attempt $attempt for worker $INSTANCE_ID"
 
@@ -411,7 +333,6 @@ jobs:
             exit 1
           fi
 
-          # Keep alive
           while true; do
             if ! pgrep -f "ggml-rpc-server" > /dev/null; then
               echo "⚠️ RPC server died, restarting..."
