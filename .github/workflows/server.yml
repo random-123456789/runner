@@ -1,45 +1,26 @@
-name: Layer-Split P2P Mesh
+name: Ray‑vLLM Swarm (5 Workers)
 
 on:
   workflow_dispatch:
-    inputs:
-      workers:
-        description: 'Number of workers (2-19)'
-        required: false
-        default: '5'
-        type: choice
-        options:
-          - '2'
-          - '3'
-          - '4'
-          - '5'
-          - '10'
-          - '19'
 
 permissions:
   actions: write
   contents: write
 
 jobs:
-  # ====================================================================
-  # QUEEN JOB – Orchestrates layer splitting and inference
-  # ====================================================================
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
-    outputs:
-      WORKER_URLS: ${{ steps.collect.outputs.WORKER_URLS }}
-      WORKER_COUNT: ${{ steps.collect.outputs.WORKER_COUNT }}
 
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake nodejs npm python3-pip
+          sudo apt-get install -y jq curl build-essential cmake python3-pip
 
-      - name: Install holesail
-        run: sudo npm install -g holesail
+      - name: Install Ray and vLLM
+        run: |
+          pip install ray[default] vllm
 
       # ---------- CLEANUP ----------
       - name: Clean workers directory
@@ -74,40 +55,16 @@ jobs:
             -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
           echo "✅ workers directory ready."
 
-      # ---------- BUILD LLAMA.CPP TOOLS ----------
-      - name: Build llama.cpp tools
-        run: |
-          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
-          unzip -q llama.cpp.zip
-          cd llama.cpp-master
-          mkdir build && cd build
-          cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
-          cmake --build . --config Release -j4 --target llama-server llama-cli ggml-rpc-server
-          cp bin/llama-server bin/llama-cli bin/ggml-rpc-server ../../
-          cd ../..
-          chmod +x llama-server llama-cli ggml-rpc-server
-
-      - name: Download model (GGUF)
-        run: |
-          MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
-          curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
-          if [ "$(head -c 4 model.gguf)" = "GGUF" ]; then
-            echo "✅ Valid GGUF file downloaded"
-          else
-            echo "❌ Invalid GGUF file"
-            exit 1
-          fi
-
-      # ---------- WAIT FOR WORKERS ----------
-      - name: Wait for workers and collect URLs
-        id: collect
+      # ---------- START RAY HEAD ----------
+      - name: Start Ray head and wait for 5 workers
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
-          WORKER_COUNT: ${{ github.event.inputs.workers || 5 }}
         run: |
-          echo "👑 Queen waiting for ${WORKER_COUNT} workers..."
+          echo "🚀 Starting Ray head node..."
+          ray start --head --port=6379 --dashboard-host=0.0.0.0 --dashboard-port=8265
 
+          echo "👑 Queen waiting for 5 workers..."
           for attempt in {1..60}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -119,127 +76,83 @@ jobs:
               COUNT=$(echo "$FILES" | grep -c . || echo 0)
             fi
             echo "  Attempt $attempt: $COUNT workers registered"
-            if [ "$COUNT" -ge "$WORKER_COUNT" ]; then
-              echo "✅ All workers registered!"
+            if [ "$COUNT" -ge 5 ]; then
+              echo "✅ All 5 workers registered!"
               break
             fi
             sleep 5
           done
-
-          if [ "$COUNT" -lt "$WORKER_COUNT" ]; then
+          if [ "$COUNT" -lt 5 ]; then
             echo "❌ Timeout waiting for workers"
             exit 1
           fi
 
-          # Build URL list
-          WORKER_URLS=""
-          for file in $FILES; do
-            curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/${REPO}/contents/workers/${file}" \
-              > /tmp/worker.json
-            URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url')
-            if [ -n "$URL" ] && [ "$URL" != "null" ]; then
-              if [ -n "$WORKER_URLS" ]; then
-                WORKER_URLS="${WORKER_URLS},${URL}"
-              else
-                WORKER_URLS="${URL}"
-              fi
-            fi
-          done
-
-          echo "WORKER_URLS=$WORKER_URLS" >> $GITHUB_ENV
-          echo "WORKER_COUNT=$WORKER_COUNT" >> $GITHUB_ENV
-          echo "::set-output name=WORKER_URLS::$WORKER_URLS"
-          echo "::set-output name=WORKER_COUNT::$WORKER_COUNT"
-
-      # ---------- CONNECT TO WORKERS VIA HOLESAIL ----------
-      - name: Connect to workers via holesail
-        env:
-          WORKER_URLS: ${{ env.WORKER_URLS }}
+      # ---------- DOWNLOAD MODEL ----------
+      - name: Download model (GGUF)
         run: |
-          echo "🔗 Connecting to workers via holesail P2P tunnels..."
-
-          docker rm -f $(docker ps -aq) 2>/dev/null || true
-
-          IFS=',' read -ra URLS <<< "${WORKER_URLS}"
-          HOST_PORT=60000
-          CONTAINER_PORTS=""
-          for i in "${!URLS[@]}"; do
-            URL="${URLS[$i]}"
-            CONTAINER_NAME="holesail-$i"
-            echo "Starting Docker container for worker $i with URL: ${URL}"
-            docker run -d --rm --name ${CONTAINER_NAME} -p ${HOST_PORT}:50052 node:22-alpine \
-              sh -c "npm install -g holesail && holesail '${URL}'" || true
-            CONTAINER_PORTS="${CONTAINER_PORTS},127.0.0.1:${HOST_PORT}"
-            HOST_PORT=$((HOST_PORT + 1))
-            sleep 2
-          done
-
-          RPC_ADDRS=${CONTAINER_PORTS:1}
-          echo "RPC_ADDRS=$RPC_ADDRS" >> $GITHUB_ENV
-          echo "✅ Connected to ${#URLS[@]} workers"
-
-      # ---------- NOVEL: LAYER-SPLIT INFERENCE ----------
-      - name: Run layer-split inference
-        env:
-          RPC_ADDRS: ${{ env.RPC_ADDRS }}
-          WORKER_COUNT: ${{ env.WORKER_COUNT }}
-        run: |
-          echo "🧠 Running layer-split inference across ${WORKER_COUNT} workers"
-
-          # Calculate layers per worker (Granite 4.0-h-tiny has ~40 layers)
-          TOTAL_LAYERS=40
-          LAYERS_PER_WORKER=$((TOTAL_LAYERS / WORKER_COUNT))
-          REMAINDER=$((TOTAL_LAYERS % WORKER_COUNT))
-
-          # Build layer assignment string
-          LAYER_ASSIGN=""
-          START=0
-          for i in $(seq 1 $WORKER_COUNT); do
-            END=$((START + LAYERS_PER_WORKER))
-            if [ $i -le $REMAINDER ]; then
-              END=$((END + 1))
-            fi
-            if [ -n "$LAYER_ASSIGN" ]; then
-              LAYER_ASSIGN="${LAYER_ASSIGN},${START}:${END}"
-            else
-              LAYER_ASSIGN="${START}:${END}"
-            fi
-            START=$END
-          done
-
-          echo "📊 Layer assignment: ${LAYER_ASSIGN}"
-          echo "🌐 RPC workers: ${RPC_ADDRS}"
-
-          # Start llama-server with layer-specific RPC
-          nohup ./llama-server \
-            -m model.gguf \
-            --rpc ${RPC_ADDRS} \
-            -c 4096 \
-            --host 0.0.0.0 \
-            --port 8080 \
-            > server.log 2>&1 &
-
-          # Wait for server
-          for i in {1..20}; do
-            if curl -s http://localhost:8080/health > /dev/null; then
-              echo "✅ llama-server is ready"
-              break
-            fi
-            sleep 2
-          done
-
-          if ! curl -s http://localhost:8080/health > /dev/null; then
-            echo "❌ llama-server failed to start"
-            cat server.log
+          MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
+          curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
+          if [ "$(head -c 4 model.gguf)" = "GGUF" ]; then
+            echo "✅ Valid GGUF file downloaded"
+          else
+            echo "❌ Invalid GGUF file"
             exit 1
           fi
 
-          # Start Cloudflare tunnel
+      # ---------- START vLLM SERVER WITH RAY ----------
+      - name: Start vLLM server with Ray (tensor_parallel_size=5)
+        run: |
+          echo "🌐 Starting vLLM server with Ray (5 workers)..."
+          python3 - <<'EOF'
+          import ray
+          from vllm import LLM, SamplingParams
+          import time
+          import os
+
+          # Connect to the local Ray cluster (head)
+          ray.init(address='auto', ignore_reinit_error=True)
+
+          # Load the model with tensor parallelism across 5 workers
+          llm = LLM(
+              model='./model.gguf',
+              tensor_parallel_size=5,
+              distributed_executor_backend='ray',
+              enforce_eager=True,
+              trust_remote_code=True,
+          )
+
+          print("✅ vLLM model loaded, server ready on port 8000")
+          # Keep the process alive
+          while True:
+              time.sleep(60)
+          EOF &
+          sleep 15
+
+          # Health check
+          for i in {1..20}; do
+            if curl -s http://localhost:8000/health > /dev/null; then
+              echo "✅ vLLM server is ready"
+              break
+            fi
+            echo "⏳ Waiting for vLLM server... ($i/20)"
+            sleep 2
+          done
+          if ! curl -s http://localhost:8000/health > /dev/null; then
+            echo "❌ vLLM server failed to start"
+            exit 1
+          fi
+
+      # ---------- CLOUDFLARE TUNNEL ----------
+      - name: Start Cloudflare tunnel
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
           echo "🌐 Starting Cloudflare tunnel..."
+
           curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
-          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
+          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8000 > tunnel.log 2>&1 &
 
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
@@ -249,6 +162,11 @@ jobs:
             fi
             sleep 3
           done
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ Failed to get tunnel URL"
+            tail -50 tunnel.log
+            exit 1
+          fi
 
           # Update config.json
           CHAT_REPO="${{ github.repository_owner }}/chat"
@@ -272,37 +190,25 @@ jobs:
           sleep infinity
 
   # ====================================================================
-  # WORKER JOBS – Each hosts a subset of layers
+  # WORKER JOBS – 5 workers join the Ray cluster
   # ====================================================================
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       matrix:
-        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        instance: [1, 2, 3, 4, 5]
 
     steps:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake nodejs npm openssl
+          sudo apt-get install -y jq curl python3-pip
 
-      - name: Install holesail
-        run: sudo npm install -g holesail
+      - name: Install Ray
+        run: pip install ray[default]
 
-      - name: Build ggml-rpc-server
-        run: |
-          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
-          unzip -q llama.cpp.zip
-          cd llama.cpp-master
-          mkdir build && cd build
-          cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
-          cmake --build . --config Release -j4 --target ggml-rpc-server
-          cp bin/ggml-rpc-server ../../
-          cd ../..
-          chmod +x ggml-rpc-server
-
-      - name: Start RPC server and register
+      - name: Start Ray worker and register
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -311,25 +217,23 @@ jobs:
           set -e
           echo "🐝 Worker $INSTANCE_ID starting..."
 
-          PORT=50052
-          ./ggml-rpc-server -p ${PORT} &
-          sleep 5
+          # Wait for Ray head to be ready
+          for attempt in {1..30}; do
+            if nc -zv queen 6379 2>/dev/null; then
+              echo "✅ Ray head is reachable"
+              break
+            fi
+            echo "⏳ Waiting for Ray head... ($attempt/30)"
+            sleep 2
+          done
 
-          echo "Starting holesail server on port ${PORT}..."
-          holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
-          sleep 5
+          # Start Ray worker and connect to head
+          ray start --address='queen:6379' --num-cpus=4
 
-          CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
-          if [ -z "$CONNECTION_STRING" ]; then
-            echo "❌ Failed to get connection string"
-            cat /tmp/holesail_output.txt
-            exit 1
-          fi
-          echo "✅ Worker $INSTANCE_ID connection string: ${CONNECTION_STRING}"
-
-          WORKER_FILE="workers/hole${INSTANCE_ID}.json"
+          # Register worker
+          WORKER_FILE="workers/ray_worker_${INSTANCE_ID}.json"
           mkdir -p workers
-          echo "{\"url\": \"${CONNECTION_STRING}\"}" > ${WORKER_FILE}
+          echo "{\"worker_id\": \"${INSTANCE_ID}\", \"status\": \"ready\"}" > ${WORKER_FILE}
           ENCODED=$(base64 -w0 ${WORKER_FILE})
 
           for attempt in {1..10}; do
@@ -374,13 +278,9 @@ jobs:
           done
 
           while true; do
-            if ! pgrep -f "ggml-rpc-server" > /dev/null; then
-              echo "⚠️ RPC server died, restarting..."
-              ./ggml-rpc-server -p ${PORT} &
-            fi
-            if ! pgrep -f "holesail" > /dev/null; then
-              echo "⚠️ holesail server died, restarting..."
-              holesail --live ${PORT} &
+            if ! pgrep -f "ray" > /dev/null; then
+              echo "⚠️ Ray worker died, restarting..."
+              ray start --address='queen:6379' --num-cpus=4
             fi
             sleep 30
           done
