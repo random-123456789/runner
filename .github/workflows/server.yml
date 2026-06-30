@@ -49,7 +49,7 @@ jobs:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "👑 Queen waiting for 19 workers..."
+          echo "👑 Queen waiting for 5 workers..."
 
           for attempt in {1..60}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
@@ -65,14 +65,14 @@ jobs:
 
             echo "  Attempt $attempt: $WORKER_COUNT workers registered"
 
-            if [ "$WORKER_COUNT" -ge 19 ]; then
+            if [ "$WORKER_COUNT" -ge 5 ]; then
               echo "✅ All workers registered!"
               break
             fi
             sleep 5
           done
 
-          if [ "$WORKER_COUNT" -lt 19 ]; then
+          if [ "$WORKER_COUNT" -lt 5 ]; then
             echo "❌ Timeout waiting for workers"
             exit 1
           fi
@@ -113,7 +113,7 @@ jobs:
     timeout-minutes: 360
     strategy:
       matrix:
-        instance: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        instance: [1, 2, 3, 4, 5]
 
     steps:
       - name: Install dependencies
