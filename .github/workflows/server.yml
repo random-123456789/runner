@@ -156,7 +156,7 @@ jobs:
 
           if [ -z "$HOLESAIL_URLS" ]; then
             echo "❌ No valid Holesail URLs found"
-            # Debug: show file contents
+            # Debug output
             echo "Worker file contents:"
             for file in $WORKER_FILES; do
               echo "  $file:"
@@ -170,7 +170,7 @@ jobs:
           echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
           echo "HOLESAIL_URLS=${HOLESAIL_URLS}"
 
-      # ---------- CONNECT TO WORKERS VIA HOLESAIL ----------
+      # ---------- CONNECT TO WORKERS VIA HOLESAIL (PORT FIX) ----------
       - name: Connect to workers via Holesail
         env:
           HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
@@ -178,11 +178,11 @@ jobs:
           echo "🔗 Connecting to workers via Holesail P2P tunnels..."
 
           IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
-          PORT=50052
+          LOCAL_PORT=50052
           for url in "${URLS[@]}"; do
-            echo "Connecting to worker with URL: ${url} -> localhost:${PORT}"
-            holesail "${url}" --listen localhost:${PORT} &
-            PORT=$((PORT+1))
+            echo "Connecting to worker with URL: ${url} -> localhost:${LOCAL_PORT}"
+            holesail "${url}" --listen localhost:${LOCAL_PORT} &
+            LOCAL_PORT=$((LOCAL_PORT + 1))
           done
 
           sleep 15
@@ -195,17 +195,17 @@ jobs:
           REPO_OWNER: ${{ github.repository_owner }}
           HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
         run: |
-          # Build RPC address list
+          # Build RPC address list using the same ports
           IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
           RPC_ADDRS=""
-          PORT=50052
+          LOCAL_PORT=50052
           for _ in "${URLS[@]}"; do
             if [ -n "$RPC_ADDRS" ]; then
-              RPC_ADDRS="${RPC_ADDRS},127.0.0.1:${PORT}"
+              RPC_ADDRS="${RPC_ADDRS},127.0.0.1:${LOCAL_PORT}"
             else
-              RPC_ADDRS="127.0.0.1:${PORT}"
+              RPC_ADDRS="127.0.0.1:${LOCAL_PORT}"
             fi
-            PORT=$((PORT+1))
+            LOCAL_PORT=$((LOCAL_PORT + 1))
           done
 
           echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
