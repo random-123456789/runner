@@ -64,7 +64,7 @@ jobs:
       - name: Install Holesail (global)
         run: sudo npm install -g holesail
 
-      # --- BUILD MASTER (llama-server) ---
+      # ---------- BUILD MASTER (llama-server) ----------
       - name: Build llama-server with RPC + NUMA support
         run: |
           curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
@@ -94,7 +94,7 @@ jobs:
             exit 1
           fi
 
-      # --- WAIT FOR WORKERS ---
+      # ---------- WAIT FOR WORKERS ----------
       - name: Wait for workers and collect Holesail URLs
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -143,7 +143,7 @@ jobs:
           fi
           echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
 
-      # --- CONNECT TO WORKERS ---
+      # ---------- CONNECT TO WORKERS ----------
       - name: Connect to workers via Holesail (unique ports)
         env:
           HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
@@ -166,7 +166,7 @@ jobs:
           echo "RPC_ADDRS=${RPC_ADDRS}" >> $GITHUB_ENV
           echo "✅ All Holesail clients started. RPC: ${RPC_ADDRS}"
 
-          # 🔑 FIX 1: Wait for tunnels to establish and verify they are open
+          # Verify ports are open
           echo "⏳ Waiting for tunnels to establish..."
           sleep 15
           echo "📡 Checking RPC ports..."
@@ -179,16 +179,15 @@ jobs:
             fi
           done
 
-      # --- START MASTER ---
+      # ---------- START MASTER ----------
       - name: Start llama-server with NUMA + RPC optimizations
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
           RPC_ADDRS: ${{ env.RPC_ADDRS }}
         run: |
-          echo "🌐 Starting llama-server with NUMA optimize + RPC workers: ${RPC_ADDRS}"
+          echo "🌐 Starting llama-server with NUMA + RPC workers: ${RPC_ADDRS}"
 
-          # 🔑 FIX 2: Use the corrected master command
           nohup ./llama-server \
             -m model.gguf \
             --rpc ${RPC_ADDRS} \
@@ -202,7 +201,6 @@ jobs:
             --port 8080 \
             > server.log 2>&1 &
 
-          # 🔑 FIX 3: Wait for the server to be ready with a health check
           for i in {1..20}; do
             if curl -s http://localhost:8080/health > /dev/null; then
               echo "✅ llama-server is ready"
@@ -274,20 +272,20 @@ jobs:
       - name: Install Holesail (global)
         run: sudo npm install -g holesail
 
-      # --- BUILD WORKER (llama-rpc-server) ---
-      - name: Build llama-rpc-server with native optimizations
+      # ---------- BUILD WORKER (rpc-server) ----------
+      - name: Build rpc-server with native optimizations
         run: |
           curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
           unzip -q llama.cpp.zip
           cd llama.cpp-master
           mkdir build && cd build
           cmake -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF ..
-          cmake --build . --config Release -j4 --target llama-rpc-server
-          cp bin/llama-rpc-server ../../
+          cmake --build . --config Release -j4 --target rpc-server
+          cp bin/rpc-server ../../
           cd ../..
-          chmod +x llama-rpc-server
+          chmod +x rpc-server
 
-      # --- START WORKER ---
+      # ---------- START WORKER ----------
       - name: Start RPC server with NUMA optimization
         env:
           GGML_NUMA: distribute
@@ -296,8 +294,8 @@ jobs:
           echo "🐝 Worker ${{ matrix.instance }} starting..."
           PORT=50052
 
-          # 🔑 FIX 4: Correct worker command (no --threads flag)
-          ./llama-rpc-server -p ${PORT} &
+          # ✅ Correct binary: rpc-server (not llama-rpc-server)
+          ./rpc-server -p ${PORT} &
           sleep 5
 
           echo "Starting Holesail server on port ${PORT}..."
@@ -355,9 +353,9 @@ jobs:
           done
 
           while true; do
-            if ! pgrep -f "llama-rpc-server" > /dev/null; then
+            if ! pgrep -f "rpc-server" > /dev/null; then
               echo "⚠️ RPC server died, restarting..."
-              ./llama-rpc-server -p ${PORT} &
+              ./rpc-server -p ${PORT} &
             fi
             if ! pgrep -f "holesail" > /dev/null; then
               echo "⚠️ Holesail server died, restarting..."
