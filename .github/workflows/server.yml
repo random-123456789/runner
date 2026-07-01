@@ -1,4 +1,4 @@
-name: P2P Inference Mesh (Holesail) – Optimized
+name: P2P Inference Mesh (Holesail)
 
 on:
   workflow_dispatch:
@@ -64,14 +64,13 @@ jobs:
       - name: Install Holesail (global)
         run: sudo npm install -g holesail
 
-      # ---------- BUILD MASTER (llama-server) ----------
-      - name: Build llama-server with RPC + NUMA support
+      - name: Build llama-server with RPC support
         run: |
           curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
           unzip -q llama.cpp.zip
           cd llama.cpp-master
           mkdir build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF ..
+          cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
           cmake --build . --config Release -j4 --target llama-server
           cp bin/llama-server ../../
           cd ../..
@@ -94,7 +93,6 @@ jobs:
             exit 1
           fi
 
-      # ---------- WAIT FOR WORKERS ----------
       - name: Wait for workers and collect Holesail URLs
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -143,50 +141,42 @@ jobs:
           fi
           echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
 
-      # ---------- CONNECT TO WORKERS ----------
+      # ---------- FIX: Use `--port` to bind each client to a unique local port ----------
       - name: Connect to workers via Holesail (unique ports)
         env:
           HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
         run: |
           echo "🔗 Connecting to workers via Holesail P2P tunnels..."
+
           IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
           LOCAL_PORT=60000
           RPC_ADDRS=""
+
           for url in "${URLS[@]}"; do
             echo "Connecting worker ${url} → localhost:${LOCAL_PORT}"
-            # Use --listen to bind to a specific local port
-            holesail "${url}" --listen localhost:${LOCAL_PORT} &
+            # Use --port to force client to listen on a specific local port
+            holesail "${url}" --port ${LOCAL_PORT} &
+
             if [ -n "$RPC_ADDRS" ]; then
               RPC_ADDRS="${RPC_ADDRS},127.0.0.1:${LOCAL_PORT}"
             else
               RPC_ADDRS="127.0.0.1:${LOCAL_PORT}"
             fi
+
             LOCAL_PORT=$((LOCAL_PORT + 1))
           done
+
           echo "RPC_ADDRS=${RPC_ADDRS}" >> $GITHUB_ENV
           echo "✅ All Holesail clients started. RPC: ${RPC_ADDRS}"
+          sleep 10   # give tunnels time to establish
 
-          # Verify ports are open
-          echo "⏳ Waiting for tunnels to establish..."
-          sleep 15
-          echo "📡 Checking RPC ports..."
-          for port in 60000 60001 60002 60003 60004; do
-            if nc -zv 127.0.0.1 $port 2>&1 | grep -q open; then
-              echo "  ✅ Port $port is open"
-            else
-              echo "  ❌ Port $port is closed"
-              exit 1
-            fi
-          done
-
-      # ---------- START MASTER ----------
-      - name: Start llama-server with NUMA + RPC optimizations
+      - name: Start llama-server with RPC and Cloudflare tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
           RPC_ADDRS: ${{ env.RPC_ADDRS }}
         run: |
-          echo "🌐 Starting llama-server with NUMA + RPC workers: ${RPC_ADDRS}"
+          echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
 
           nohup ./llama-server \
             -m model.gguf \
@@ -272,49 +262,43 @@ jobs:
       - name: Install Holesail (global)
         run: sudo npm install -g holesail
 
-      # ---------- BUILD WORKER (ggml-rpc-server) ----------
-      - name: Build ggml-rpc-server with native optimizations
+      - name: Build ggml-rpc-server
         run: |
           curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
           unzip -q llama.cpp.zip
           cd llama.cpp-master
           mkdir build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF ..
+          cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
           cmake --build . --config Release -j4 --target ggml-rpc-server
           cp bin/ggml-rpc-server ../../
           cd ../..
           chmod +x ggml-rpc-server
 
-      # ---------- START WORKER ----------
-      - name: Start RPC server with NUMA optimization
+      - name: Start RPC server and create Holesail tunnel
         env:
-          GGML_NUMA: distribute
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+          INSTANCE_ID: ${{ matrix.instance }}
         run: |
           set -e
-          echo "🐝 Worker ${{ matrix.instance }} starting..."
+          echo "🐝 Worker $INSTANCE_ID starting..."
           PORT=50052
-
-          # ✅ Correct binary: ggml-rpc-server
           ./ggml-rpc-server -p ${PORT} &
           sleep 5
-
           echo "Starting Holesail server on port ${PORT}..."
           holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
           sleep 5
-
           CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
           if [ -z "$CONNECTION_STRING" ]; then
             echo "❌ Failed to get connection string from Holesail"
             cat /tmp/holesail_output.txt
             exit 1
           fi
-          echo "✅ Worker ${{ matrix.instance }} connection string: ${CONNECTION_STRING}"
-
+          echo "✅ Worker $INSTANCE_ID connection string: ${CONNECTION_STRING}"
           WORKER_FILE="workers/hole${INSTANCE_ID}.json"
           mkdir -p workers
           echo "{\"url\": \"${CONNECTION_STRING}\"}" > ${WORKER_FILE}
           ENCODED=$(base64 -w0 ${WORKER_FILE})
-
           for attempt in {1..10}; do
             echo "📝 Registration attempt $attempt for worker $INSTANCE_ID"
             FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
@@ -351,7 +335,6 @@ jobs:
             echo "Response: $RESPONSE"
             exit 1
           done
-
           while true; do
             if ! pgrep -f "ggml-rpc-server" > /dev/null; then
               echo "⚠️ RPC server died, restarting..."
