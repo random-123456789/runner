@@ -165,11 +165,10 @@ jobs:
           RPC_ADDRS: ${{ env.RPC_ADDRS }}
         run: |
           echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
-          ./llama-server \
+          nohup ./llama-server \
                 -m model.gguf \
                 --rpc ${RPC_ADDRS} \
                 -ts 1,1,1,1,1 \ 
-                --numa distribute \
                 -fa on \
                 -ngl 0 \
                 -t 4 \
@@ -179,7 +178,7 @@ jobs:
                 -dio \
                 --host 0.0.0.0 \
                 --port 8080 \
-                &
+                > server.log 2>&1 &
           for i in {1..20}; do
             if curl -s http://localhost:8080/health > /dev/null; then
               echo "✅ llama-server is ready"
