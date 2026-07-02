@@ -70,7 +70,7 @@ jobs:
           unzip -q llama.cpp.zip
           cd llama.cpp-master
           mkdir build && cd build
-          cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF -DGGML_NATIVE=ON
+          cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF -DGGML_NATIVE=ON -DGGML_NUMA_MIGRATE=ON
           cmake --build . --config Release -j4 --target llama-server
           cp bin/llama-server ../../
           cd ../..
@@ -179,6 +179,7 @@ jobs:
           echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
 
           nohup ./llama-server \
+                --no-mmap \
                 -m model.gguf \
                 --rpc ${RPC_ADDRS} \
                 --numa distribute \
