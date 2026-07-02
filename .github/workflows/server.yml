@@ -247,10 +247,10 @@ jobs:
           cd llama.cpp-b8487
           mkdir build && cd build
           cmake .. -DGGML_NATIVE=ON -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
-          cmake --build . --config Release -j4 --target ggml-rpc-server
-          cp bin/ggml-rpc-server ../../
+          cmake --build . --config Release -j4 --target llama-rpc-server
+          cp bin/llama-rpc-server ../../
           cd ../..
-          chmod +x ggml-rpc-server
+          chmod +x llama-rpc-server
       - name: Start RPC server and create Holesail tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -260,7 +260,7 @@ jobs:
           set -e
           echo "🐝 Worker $INSTANCE_ID starting..."
           PORT=50052
-          ./ggml-rpc-server -H 0.0.0.0 -p ${PORT} -c &
+          ./llama-rpc-server -H 0.0.0.0 -p ${PORT} -c &
           sleep 5
           echo "Starting Holesail server on port ${PORT}..."
           holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
@@ -315,7 +315,7 @@ jobs:
           while true; do
             if ! pgrep -f "ggml-rpc-server" > /dev/null; then
               echo "⚠️ RPC server died, restarting..."
-              ./ggml-rpc-server -p ${PORT} &
+              ./llama-rpc-server -H 0.0.0.0 -p ${PORT} -c &
             fi
             if ! pgrep -f "holesail" > /dev/null; then
               echo "⚠️ Holesail server died, restarting..."
