@@ -8,16 +8,12 @@ permissions:
   contents: write
 
 jobs:
-  # ------------------------------------------------
-  # 19 Workers – each starts exo and joins the cluster
-  # ------------------------------------------------
-  worker:
+  # ============================================================
+  #  QUEEN – starts Zenoh router and API server (no worker)
+  # ============================================================
+  queen:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        worker_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
     timeout-minutes: 360
-
     steps:
       - name: Install dependencies
         run: |
@@ -25,13 +21,109 @@ jobs:
           sudo apt-get install -y curl jq build-essential nodejs npm
           # Install uv (Python package manager)
           curl -LsSf https://astral.sh/uv/install.sh | sh
-          # Install Rust (required for exo)
+          # Install Rust (for zenohd)
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           source "$HOME/.cargo/env"
           rustup toolchain install nightly
-          # Install Node.js dependencies for the dashboard (optional)
+          # Install Node.js dependencies for dashboard build
           sudo npm install -g npm@latest
           # Install Holesail globally
+          sudo npm install -g holesail
+
+      - name: Install zenohd (router) from pre‑built binary
+        run: |
+          # Download zenohd for Linux x86_64 from the official release
+          ZENOH_VERSION="1.0.0"  # adjust to latest if needed
+          curl -L "https://github.com/eclipse-zenoh/zenoh/releases/download/${ZENOH_VERSION}/zenohd-${ZENOH_VERSION}-x86_64-unknown-linux-gnu.zip" -o zenohd.zip
+          unzip zenohd.zip
+          chmod +x zenohd
+          sudo mv zenohd /usr/local/bin/
+
+      - name: Clone exo (for dashboard and API)
+        run: |
+          git clone https://github.com/exo-explore/exo.git
+          cd exo/dashboard
+          npm install
+          npm run build
+          cd ../..
+
+      - name: Start Zenoh router and expose via Holesail
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "🕸️ Starting Zenoh router on port 7447..."
+          zenohd --listen tcp/0.0.0.0:7447 &
+          sleep 3
+
+          echo "🔗 Exposing Zenoh router via Holesail..."
+          holesail --live 7447 > /tmp/holesail_zenoh.txt 2>&1 &
+          sleep 5
+
+          ZENOH_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_zenoh.txt | head -1)
+          if [ -z "$ZENOH_URL" ]; then
+            echo "❌ Failed to get Holesail URL for Zenoh router"
+            cat /tmp/holesail_zenoh.txt
+            exit 1
+          fi
+          echo "✅ Zenoh router URL: $ZENOH_URL"
+
+          # Write URL to a file and base64 encode
+          echo "$ZENOH_URL" > queen_zenoh_url.txt
+          ENCODED=$(base64 -w0 queen_zenoh_url.txt)
+
+          # Try to create/update the file in the repo
+          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt")
+          SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
+
+          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+            PAYLOAD=$(jq -n \
+              --arg msg "publish zenoh router url" \
+              --arg content "$ENCODED" \
+              --arg sha "$SHA" \
+              '{message: $msg, content: $content, sha: $sha}')
+          else
+            PAYLOAD=$(jq -n \
+              --arg msg "publish zenoh router url" \
+              --arg content "$ENCODED" \
+              '{message: $msg, content: $content}')
+          fi
+
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt" \
+            -d "$PAYLOAD"
+
+      - name: Start exo queen (API only)
+        run: |
+          cd exo
+          # Run exo in no-worker mode, which starts the API server
+          uv run exo --no-worker &
+          # Keep alive
+          sleep infinity
+
+  # ============================================================
+  #  WORKERS – each joins the cluster via the Queen's Zenoh router
+  # ============================================================
+  worker:
+    needs: queen   # Queen must publish its URL first
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        worker_id: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    timeout-minutes: 360
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y curl jq build-essential nodejs npm
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source "$HOME/.cargo/env"
+          rustup toolchain install nightly
+          sudo npm install -g npm@latest
           sudo npm install -g holesail
 
       - name: Clone exo and build dashboard
@@ -52,7 +144,7 @@ jobs:
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt" 2>/dev/null)
-            URL=$(echo "$RESPONSE" | jq -r '.content' | base64 -d 2>/dev/null)
+            URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null)
             if [ -n "$URL" ] && [ "$URL" != "null" ]; then
               echo "Fetched URL: $URL"
               echo "ZENOH_ROUTER_URL=$URL" >> $GITHUB_ENV
@@ -75,94 +167,11 @@ jobs:
 
       - name: Run exo worker
         env:
-          # Tell exo to use our local forwarded Zenoh router as its rendezvous point
+          # Tell exo to use the local forwarded router
           ZENOH_CONFIG: '{"connect": {"endpoints": ["tcp/localhost:7447"]}}'
         run: |
           cd exo
-          # Start exo in the background – it will auto-discover other workers via Zenoh
+          # Start exo – it will auto‑discover other workers via Zenoh
           uv run exo &
           # Keep the job alive
-          sleep infinity
-
-  # ------------------------------------------------
-  # Queen Node – coordinator + Zenoh router
-  # ------------------------------------------------
-  queen:
-    needs: worker  # ensure workers are attempted first, but we want queen to start first?
-    # Actually we want queen to start first to publish its URL. We'll change the dependency.
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-
-    steps:
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y curl jq build-essential nodejs npm
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          source "$HOME/.cargo/env"
-          rustup toolchain install nightly
-          sudo npm install -g npm@latest
-          sudo npm install -g holesail
-          # Install zenohd (the router) – we can also use cargo install zenohd, but it's heavy.
-          # Alternatively, we can run the router using the zenoh crate directly.
-          # For simplicity, we'll use a simple script that runs a Zenoh router via Python? 
-          # Actually exo already embeds Zenoh; we can run exo in a mode that starts a router.
-          # But exo's --no-worker might not start a router. We'll start a separate router process.
-          cargo install zenohd
-
-      - name: Clone exo (for dashboard and eventual API)
-        run: |
-          git clone https://github.com/exo-explore/exo.git
-          cd exo/dashboard
-          npm install
-          npm run build
-          cd ../..
-
-      - name: Start Zenoh router and expose via Holesail
-        run: |
-          echo "🕸️ Starting Zenoh router on port 7447..."
-          zenohd --listen tcp/0.0.0.0:7447 &
-          sleep 3
-          echo "🔗 Exposing Zenoh router via Holesail..."
-          holesail --live 7447 > /tmp/holesail_zenoh.txt 2>&1 &
-          sleep 5
-          ZENOH_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_zenoh.txt | head -1)
-          if [ -z "$ZENOH_URL" ]; then
-            echo "❌ Failed to get Holesail URL for Zenoh router"
-            cat /tmp/holesail_zenoh.txt
-            exit 1
-          fi
-          echo "✅ Zenoh router URL: $ZENOH_URL"
-
-          # Publish the URL to the repository so workers can fetch it
-          echo "$ZENOH_URL" > queen_zenoh_url.txt
-          ENCODED=$(base64 -w0 queen_zenoh_url.txt)
-          REPO="${{ github.repository }}"
-          GH_TOKEN="${{ secrets.TOKEN }}"
-          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt")
-          SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
-          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-            PAYLOAD=$(jq -n --arg msg "publish zenoh router url" --arg content "$ENCODED" --arg sha "$SHA" \
-              '{message: $msg, content: $content, sha: $sha}')
-          else
-            PAYLOAD=$(jq -n --arg msg "publish zenoh router url" --arg content "$ENCODED" \
-              '{message: $msg, content: $content}')
-          fi
-          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt" \
-            -d "$PAYLOAD"
-
-      - name: Start exo queen (API only)
-        env:
-          # Queen doesn't need to connect to the router; it hosts the router.
-          # But exo might need to know its own address? We'll start with --no-worker.
-        run: |
-          cd exo
-          # Run exo in no-worker mode, which starts the API server but no inference worker.
-          uv run exo --no-worker &
-          # Keep alive
           sleep infinity
