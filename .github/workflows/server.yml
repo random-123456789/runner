@@ -178,13 +178,13 @@ jobs:
         run: |
           echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
 
-          ./llama-cli \
-          -m model.gguf \
-          --rpc ${RPC_ADDRS} \
-          --tensor-split 5 \
-          -p "What is the meaning of life?" \
-          -n 256 \
-          -t 4
+          ./llama-server \
+            -m model.gguf \
+            --rpc ${RPC_ADDRS} \
+            --device RPC0,RPC1,RPC2,RPC3,RPC4 \
+            --tensor-split 1,1,1,1,1 \
+            -c 4096 \
+            &
           
 
           for i in {1..600}; do
