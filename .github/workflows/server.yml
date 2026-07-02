@@ -240,7 +240,7 @@ jobs:
       - name: Install Holesail (global)
         run: sudo npm install -g holesail
 
-      - name: Build ggml-rpc-server
+      - name: Build rpc-server
         run: |
           curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/tags/b8487.zip
           unzip -q llama.cpp.zip
@@ -313,9 +313,9 @@ jobs:
             exit 1
           done
           while true; do
-            if ! pgrep -f "ggml-rpc-server" > /dev/null; then
+            if ! pgrep -f "rpc-server" > /dev/null; then
               echo "⚠️ RPC server died, restarting..."
-              ./llama-rpc-server -H 0.0.0.0 -p ${PORT} -c &
+              ./rpc-server -H 0.0.0.0 -p ${PORT} -c &
             fi
             if ! pgrep -f "holesail" > /dev/null; then
               echo "⚠️ Holesail server died, restarting..."
