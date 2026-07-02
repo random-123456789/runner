@@ -178,16 +178,14 @@ jobs:
         run: |
           echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
 
-          ./llama-server \
-                --no-mmap \
-                -m model.gguf \
-                --rpc ${RPC_ADDRS} \
-                -fa on \
-                -ngl 0 \
-                -t 4 \
-                -tb 4 \
-                -c 4096 \
-                &
+          ./llama-cli \
+          -m model.gguf \
+          --rpc ${RPC_ADDRS} \
+          --tensor-split 5 \
+          -p "What is the meaning of life?" \
+          -n 256 \
+          -t 4
+          
 
           for i in {1..600}; do
             if curl -s http://localhost:8080/health > /dev/null; then
