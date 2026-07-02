@@ -15,6 +15,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
+
+      - name: Clean up previous queen Zenoh URL file
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "🧹 Deleting previous queen_zenoh_url.txt..."
+          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt" 2>/dev/null)
+          SHA=$(echo "$RESPONSE" | jq -r '.sha' 2>/dev/null)
+          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+            curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt" \
+              -d "{\"message\":\"cleanup\",\"sha\":\"$SHA\"}"
+            echo "✅ Deleted old file"
+          else
+            echo "ℹ️ No existing file to delete"
+          fi
+          
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
@@ -87,14 +108,18 @@ jobs:
       - name: Start exo queen (API only) with correct Zenoh config
         run: |
           cd exo
-          # Configure exo to use the local Zenoh router
           export ZENOH_CONFIG='{"mode": "client", "connect": {"endpoints": ["tcp/localhost:7447"]}, "scouting": {"multicast": {"enabled": false}}}'
           echo "ZENOH_CONFIG=$ZENOH_CONFIG"
-          # Start exo in the background and capture logs
-          nohup uv run exo --no-worker > exo_queen.log 2>&1 &
+          # Use env to pass the variable to nohup
+          nohup env ZENOH_CONFIG="$ZENOH_CONFIG" uv run exo --no-worker > exo_queen.log 2>&1 &
           sleep 10
-          # Verify it's running
-          pgrep -f "exo" && echo "✅ exo process is running" || echo "⚠️ exo process not found"
+          if pgrep -f "exo"; then
+            echo "✅ exo process is running"
+          else
+            echo "❌ exo process not found – showing log:"
+            cat exo_queen.log
+            exit 1
+          fi
 
       - name: Start Cloudflare tunnel for exo API
         run: |
@@ -106,7 +131,6 @@ jobs:
             fi
             echo "⏳ Waiting... ($i/60)"
             sleep 2
-            # After 30 attempts, print the exo log to debug
             if [ $i -eq 30 ]; then
               echo "📄 exo_queen.log (first 50 lines):"
               head -50 exo_queen.log || true
@@ -177,7 +201,7 @@ jobs:
         run: |
           echo "📡 Fetching Queen's Zenoh router URL..."
           ZENOH_URL=""
-          for attempt in {1..30}; do
+          for attempt in {1..60}; do   # increased to 60 (5 minutes)
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt" 2>/dev/null)
@@ -187,7 +211,7 @@ jobs:
               ZENOH_URL="$URL"
               break
             fi
-            echo "  Waiting for Queen to publish its Zenoh router URL... ($attempt/30)"
+            echo "  Waiting for Queen to publish its Zenoh router URL... ($attempt/60)"
             sleep 5
           done
           if [ -z "$ZENOH_URL" ]; then
@@ -214,8 +238,7 @@ jobs:
         run: |
           cd exo
           echo "ZENOH_CONFIG=$ZENOH_CONFIG"
-          nohup uv run exo > exo_worker.log 2>&1 &
+          nohup env ZENOH_CONFIG="$ZENOH_CONFIG" uv run exo > exo_worker.log 2>&1 &
           sleep 10
           pgrep -f "exo" && echo "✅ Worker exo is running" || echo "⚠️ Worker exo not found"
-          # Keep alive
           sleep infinity
