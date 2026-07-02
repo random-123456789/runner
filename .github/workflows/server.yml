@@ -166,17 +166,14 @@ jobs:
         run: |
           echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
           ./llama-server \
-                -m model.gguf \
-                --rpc ${RPC_ADDRS} \
-                --device RPC0,RPC1,RPC2,RPC3,RPC4 \
-                --tensor-split 1,1,1,1,1 \
-                -fa on \
-                -ngl 0 \
-                -c 4096 \
-                --host 0.0.0.0 \
-                --port 8080 \
-                &
-          for i in {1..300}; do
+            -m model.gguf \
+            --rpc ${RPC_ADDRS} \
+            --device RPC0,RPC1,RPC2,RPC3,RPC4 \
+            --tensor-split 1,1,1,1,1 \
+            -c 4096 \
+            &
+          
+          for i in {1..600}; do
             if curl -s http://localhost:8080/health > /dev/null; then
               echo "✅ llama-server is ready"
               break
