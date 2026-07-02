@@ -67,7 +67,7 @@ jobs:
           unzip -q llama.cpp.zip
           cd llama.cpp-master
           mkdir build && cd build
-          cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF -DGGML_NATIVE=ON -DGGML_NUMA_MIGRATE=ON
+          cmake .. -DGGML_NATIVE=ON -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
           cmake --build . --config Release -j4 --target llama-server
           cp bin/llama-server ../../
           cd ../..
@@ -165,7 +165,7 @@ jobs:
           RPC_ADDRS: ${{ env.RPC_ADDRS }}
         run: |
           echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
-          nohup ./llama-server \
+          ./llama-server \
                 -m model.gguf \
                 --rpc ${RPC_ADDRS} \
                 --tensor-split 1,1,1,1,1 \
@@ -174,7 +174,7 @@ jobs:
                 -c 4096 \
                 --host 0.0.0.0 \
                 --port 8080 \
-                > server.log 2>&1 &
+                &
           for i in {1..300}; do
             if curl -s http://localhost:8080/health > /dev/null; then
               echo "✅ llama-server is ready"
@@ -247,7 +247,7 @@ jobs:
           unzip -q llama.cpp.zip
           cd llama.cpp-master
           mkdir build && cd build
-          cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF -DGGML_NATIVE=ON -DGGML_NUMA_MIGRATE=ON
+          cmake .. -DGGML_NATIVE=ON -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
           cmake --build . --config Release -j4 --target ggml-rpc-server
           cp bin/ggml-rpc-server ../../
           cd ../..
