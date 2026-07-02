@@ -182,7 +182,6 @@ jobs:
                 - v \
                 -m model.gguf \
                 --rpc ${RPC_ADDRS} \
-                -mmp 0 \
                 --numa distribute \
                 -fa on \
                 -ngl 0 \
