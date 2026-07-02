@@ -179,6 +179,7 @@ jobs:
           echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
 
           nohup ./llama-server \
+                - v \
                 -m model.gguf \
                 --rpc ${RPC_ADDRS} \
                 -mmp 0 \
