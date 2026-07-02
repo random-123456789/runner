@@ -31,7 +31,6 @@ jobs:
             fi
           done
           echo "✅ Cleanup done."
-
       - name: Create workers directory
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -55,12 +54,10 @@ jobs:
               -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
           fi
           echo "✅ workers directory ready."
-
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y jq curl build-essential cmake nodejs npm openssl
-
       - name: Install Holesail (global)
         run: sudo npm install -g holesail
 
@@ -70,7 +67,7 @@ jobs:
           unzip -q llama.cpp.zip
           cd llama.cpp-master
           mkdir build && cd build
-          cmake .. -DGGML_NATIVE=ON -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
+          cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF -DGGML_NATIVE=ON -DGGML_NUMA_MIGRATE=ON
           cmake --build . --config Release -j4 --target llama-server
           cp bin/llama-server ../../
           cd ../..
@@ -81,7 +78,6 @@ jobs:
             echo "❌ llama-server RPC support missing"
             exit 1
           fi
-
       - name: Download model
         run: |
           MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
@@ -92,7 +88,6 @@ jobs:
             echo "❌ Invalid GGUF file"
             exit 1
           fi
-
       - name: Wait for workers and collect Holesail URLs
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -140,36 +135,29 @@ jobs:
             exit 1
           fi
           echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
-
       # ---------- FIX: Use `--port` to bind each client to a unique local port ----------
       - name: Connect to workers via Holesail (unique ports)
         env:
           HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
         run: |
           echo "🔗 Connecting to workers via Holesail P2P tunnels..."
-
           IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
           LOCAL_PORT=60000
           RPC_ADDRS=""
-
           for url in "${URLS[@]}"; do
             echo "Connecting worker ${url} → localhost:${LOCAL_PORT}"
             # Use --port to force client to listen on a specific local port
             holesail "${url}" --port ${LOCAL_PORT} &
-
             if [ -n "$RPC_ADDRS" ]; then
               RPC_ADDRS="${RPC_ADDRS},127.0.0.1:${LOCAL_PORT}"
             else
               RPC_ADDRS="127.0.0.1:${LOCAL_PORT}"
             fi
-
             LOCAL_PORT=$((LOCAL_PORT + 1))
           done
-
           echo "RPC_ADDRS=${RPC_ADDRS}" >> $GITHUB_ENV
           echo "✅ All Holesail clients started. RPC: ${RPC_ADDRS}"
           sleep 10   # give tunnels time to establish
-
       - name: Start llama-server with RPC and Cloudflare tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -177,17 +165,19 @@ jobs:
           RPC_ADDRS: ${{ env.RPC_ADDRS }}
         run: |
           echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
-
-          ./llama-server \
-            -m model.gguf \
-            --rpc ${RPC_ADDRS} \
-            --device RPC0,RPC1,RPC2,RPC3,RPC4 \
-            --tensor-split 1,1,1,1,1 \
-            -c 4096 \
-            &
-          
-
-          for i in {1..600}; do
+          nohup ./llama-server \
+                -m model.gguf \
+                --rpc ${RPC_ADDRS} \
+                --numa distribute \
+                -fa on \
+                -ngl 0 \
+                -t 4 \
+                -tb 4 \
+                -c 4096 \
+                --host 0.0.0.0 \
+                --port 8080 \
+                > server.log 2>&1 &
+          for i in {1..20}; do
             if curl -s http://localhost:8080/health > /dev/null; then
               echo "✅ llama-server is ready"
               break
@@ -200,14 +190,12 @@ jobs:
             cat server.log
             exit 1
           fi
-
           echo "🌐 Starting Cloudflare tunnel..."
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x cloudflared
           fi
           nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
-
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$TUNNEL_URL" ]; then
@@ -222,7 +210,6 @@ jobs:
             tail -50 tunnel.log
             exit 1
           fi
-
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
@@ -241,7 +228,6 @@ jobs:
           echo "::notice::Frontend URL: https://$CHAT_REPO"
           echo "🔄 Queen is serving. Keeping alive..."
           sleep infinity
-
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -254,7 +240,6 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y jq curl build-essential cmake nodejs npm openssl
-
       - name: Install Holesail (global)
         run: sudo npm install -g holesail
 
@@ -264,12 +249,11 @@ jobs:
           unzip -q llama.cpp.zip
           cd llama.cpp-master
           mkdir build && cd build
-          cmake .. -DGGML_NATIVE=ON -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
+          cmake .. -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF -DGGML_NATIVE=ON -DGGML_NUMA_MIGRATE=ON
           cmake --build . --config Release -j4 --target ggml-rpc-server
           cp bin/ggml-rpc-server ../../
           cd ../..
           chmod +x ggml-rpc-server
-
       - name: Start RPC server and create Holesail tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
