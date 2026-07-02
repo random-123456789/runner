@@ -84,26 +84,38 @@ jobs:
             "https://api.github.com/repos/${REPO}/contents/queen_zenoh_url.txt" \
             -d "$PAYLOAD"
 
-      - name: Start exo queen (API only)
+      - name: Start exo queen (API only) with correct Zenoh config
         run: |
           cd exo
-          uv run exo --no-worker &
-          sleep 10   # give it a moment to bind
+          # Configure exo to use the local Zenoh router
+          export ZENOH_CONFIG='{"mode": "client", "connect": {"endpoints": ["tcp/localhost:7447"]}, "scouting": {"multicast": {"enabled": false}}}'
+          echo "ZENOH_CONFIG=$ZENOH_CONFIG"
+          # Start exo in the background and capture logs
+          nohup uv run exo --no-worker > exo_queen.log 2>&1 &
+          sleep 10
+          # Verify it's running
+          pgrep -f "exo" && echo "✅ exo process is running" || echo "⚠️ exo process not found"
 
       - name: Start Cloudflare tunnel for exo API
         run: |
           echo "🌐 Waiting for exo API to be ready..."
-          for i in {1..30}; do
+          for i in {1..60}; do
             if curl -s http://localhost:52415/health > /dev/null; then
               echo "✅ exo API is ready"
               break
             fi
-            echo "⏳ Waiting... ($i/30)"
-            sleep 5
+            echo "⏳ Waiting... ($i/60)"
+            sleep 2
+            # After 30 attempts, print the exo log to debug
+            if [ $i -eq 30 ]; then
+              echo "📄 exo_queen.log (first 50 lines):"
+              head -50 exo_queen.log || true
+            fi
           done
 
           if ! curl -s http://localhost:52415/health > /dev/null; then
-            echo "❌ exo API failed to start"
+            echo "❌ exo API failed to start – showing full log:"
+            cat exo_queen.log
             exit 1
           fi
 
@@ -135,7 +147,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # For production: [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+        # For production: [1..19]
         worker_id: [1, 2, 3, 4, 5]   # change to 19 for full cluster
     timeout-minutes: 360
     steps:
@@ -202,5 +214,8 @@ jobs:
         run: |
           cd exo
           echo "ZENOH_CONFIG=$ZENOH_CONFIG"
-          uv run exo &
+          nohup uv run exo > exo_worker.log 2>&1 &
+          sleep 10
+          pgrep -f "exo" && echo "✅ Worker exo is running" || echo "⚠️ Worker exo not found"
+          # Keep alive
           sleep infinity
