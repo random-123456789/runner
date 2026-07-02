@@ -184,6 +184,8 @@ jobs:
                 --numa distribute \
                 -fa on \
                 -ngl 0 \
+                -t 4 \
+                -tb 4 \
                 -c 4096 \
                 --host 0.0.0.0 \
                 --port 8080 \
@@ -281,7 +283,7 @@ jobs:
           set -e
           echo "🐝 Worker $INSTANCE_ID starting..."
           PORT=50052
-          ./ggml-rpc-server -p ${PORT} -c &
+          ./ggml-rpc-server -p ${PORT} -c -v &
           sleep 5
           echo "Starting Holesail server on port ${PORT}..."
           holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
