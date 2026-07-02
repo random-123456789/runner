@@ -168,6 +168,7 @@ jobs:
           ./llama-server \
                 -m model.gguf \
                 --rpc ${RPC_ADDRS} \
+                --device RPC0,RPC1,RPC2,RPC3,RPC4 \
                 --tensor-split 1,1,1,1,1 \
                 -fa on \
                 -ngl 0 \
