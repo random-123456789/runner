@@ -9,7 +9,6 @@ permissions:
 
 env:
   WORKER_COUNT: 4
-  # Use a single-file GGUF model (small, fast download, verified)
   MODEL_URL: "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
 
 jobs:
@@ -248,15 +247,26 @@ jobs:
             --port 8080 \
             > master.log 2>&1 &
 
-          for i in {1..60}; do
-            if curl -s http://localhost:8080/health > /dev/null; then
-              echo "✅ prima.cpp master ready"
+      - name: Wait for master to be truly ready (200 OK)
+        run: |
+          echo "🌐 Waiting for master API to be ready..."
+          READY=false
+          for i in {1..150}; do
+            if curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health | grep -q 200; then
+              echo "✅ Master API ready"
+              READY=true
               break
             fi
+            echo "⏳ Waiting... ($i/150)"
             sleep 2
+            if [ $i -eq 30 ]; then
+              echo "📄 master.log (last 20 lines):"
+              tail -20 master.log || true
+            fi
           done
-          if ! curl -s http://localhost:8080/health > /dev/null; then
-            echo "❌ Master failed to start"
+          if [ "$READY" != "true" ]; then
+            echo "❌ Master failed to become ready within 5 minutes"
+            echo "📄 Full master.log:"
             cat master.log
             exit 1
           fi
@@ -358,10 +368,16 @@ jobs:
           fi
           echo "MASTER_HOLESAIL_URL=$MASTER_URL" >> $GITHUB_ENV
 
-      - name: Connect to master
+      - name: Connect to master via Holesail and test
         run: |
           holesail --connect "$MASTER_HOLESAIL_URL" --port 6000 &
-          sleep 5
+          sleep 10
+          if nc -zv 127.0.0.1 6000 2>&1 | grep -q "succeeded"; then
+            echo "✅ Tunnel to master is open on 127.0.0.1:6000"
+          else
+            echo "❌ Tunnel failed – cannot connect to master"
+            exit 1
+          fi
 
       - name: Expose worker and register
         env:
@@ -460,6 +476,9 @@ jobs:
             --next "$NEXT" \
             --prefetch \
             > worker.log 2>&1 &
+          sleep 10
+          echo "📄 worker.log (first 20 lines):"
+          head -20 worker.log || true
 
       - name: Keep alive
         run: sleep infinity
