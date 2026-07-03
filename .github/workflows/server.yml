@@ -8,14 +8,10 @@ permissions:
   contents: write
 
 env:
-  WORKER_COUNT: 4                      # number of workers (total nodes = WORKER_COUNT + 1)
+  WORKER_COUNT: 4
   MODEL_URL: "https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
-  # For 70B, use: https://huggingface.co/Qwen/Qwen2.5-72B-GGUF/resolve/main/qwen2.5-72b-instruct-q6_k.gguf
 
 jobs:
-  # ============================================================
-  #  QUEEN (Master Node, rank 0)
-  # ============================================================
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -38,7 +34,6 @@ jobs:
                 -d "{\"message\":\"cleanup\",\"sha\":\"${sha}\"}" || true
             fi
           done
-          # Also clean old next_url files
           for i in $(seq 1 $WORKER_COUNT); do
             curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -53,7 +48,7 @@ jobs:
           sudo apt-get install -y curl jq build-essential cmake git wget libzmq3-dev
           sudo npm install -g holesail
 
-      - name: Install fio (disk performance profiling)
+      - name: Install fio
         run: |
           sudo apt-get install -y fio || true
           if ! command -v fio &> /dev/null; then
@@ -65,7 +60,7 @@ jobs:
             cd ..
           fi
 
-      - name: Install HiGHS (optimization library for Halda scheduler)
+      - name: Install HiGHS
         run: |
           git clone https://github.com/ERGO-Code/HiGHS.git
           cd HiGHS
@@ -103,15 +98,15 @@ jobs:
             "https://api.github.com/repos/${REPO}/contents/master_url.txt" \
             -d "{\"message\":\"publish master url\",\"content\":\"$ENCODED\"}" || true
 
-      - name: Wait for workers to register and publish their URLs
+      - name: Wait for workers and build ring
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
           WORKER_COUNT: ${{ env.WORKER_COUNT }}
+          MASTER_URL: ${{ env.MASTER_HOLESAIL_URL }}   # <-- FIX: Pass the master URL
         run: |
           echo "👑 Queen waiting for $WORKER_COUNT workers..."
           for attempt in {1..60}; do
-            WORKER_URLS=""
             ALL_FOUND=true
             for i in $(seq 1 $WORKER_COUNT); do
               RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
@@ -121,12 +116,6 @@ jobs:
                 ALL_FOUND=false
                 break
               fi
-              URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
-              if [ -z "$URL" ] || [ "$URL" = "null" ]; then
-                ALL_FOUND=false
-                break
-              fi
-              WORKER_URLS="${WORKER_URLS} ${URL}"
             done
             if [ "$ALL_FOUND" = true ]; then
               echo "✅ All workers registered!"
@@ -139,25 +128,23 @@ jobs:
             echo "❌ Timeout waiting for workers"
             exit 1
           fi
-          # Store worker URLs in an array
-          WORKER_URL_ARRAY=($WORKER_URLS)
-          # Write next_url files: for each worker, the next is the next index (wrapping to master)
+
+          # Build ring: worker i → worker i+1, last → master
           for i in $(seq 1 $WORKER_COUNT); do
             NEXT_INDEX=$((i + 1))
             if [ $NEXT_INDEX -gt $WORKER_COUNT ]; then
+              # Last worker points to master
               NEXT_URL="$MASTER_URL"
             else
-              NEXT_URL="${WORKER_URL_ARRAY[$((i-1))]}" # next is current? Actually we need URL of next worker.
-              # The array is in order of worker ids. We need to map worker id to URL.
-              # Let's assume workers wrote files in order.
-              # We'll read URLs from files in order.
-              # Better: we have already fetched URLs in order of i.
-              NEXT_URL="${WORKER_URLS##* }"
-              # We'll fetch again in the loop.
+              # Fetch the next worker's URL directly
               RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
                 -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/${REPO}/contents/workers/worker_${NEXT_INDEX}.txt" 2>/dev/null)
               NEXT_URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
+              if [ -z "$NEXT_URL" ] || [ "$NEXT_URL" = "null" ]; then
+                echo "❌ Failed to get next URL for worker $i (next worker $NEXT_INDEX)"
+                exit 1
+              fi
             fi
             echo "$NEXT_URL" > next_url_${i}.txt
             ENCODED_NEXT=$(base64 -w0 next_url_${i}.txt)
@@ -173,7 +160,6 @@ jobs:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          # Fetch worker 1 URL
           RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/contents/workers/worker_1.txt" 2>/dev/null)
@@ -182,15 +168,12 @@ jobs:
             echo "❌ Failed to get worker 1 URL"
             exit 1
           fi
-          # Connect to worker 1's RPC port (5000+1) but we need to map it to a local port for --next
-          # Worker 1 exposes port 5001. We'll map it to local 7001.
           holesail --connect "$WORKER1_URL" --port 7001 &
           sleep 5
 
       - name: Start prima.cpp master (rank 0)
         run: |
           cd prima.cpp
-          # Master's --next is worker 1's local port (7001)
           nohup ./llama-cli \
             -m ../models/model.gguf \
             -c 2048 \
@@ -232,9 +215,6 @@ jobs:
       - name: Keep alive
         run: sleep infinity
 
-  # ============================================================
-  #  WORKERS (ranks 1..WORKER_COUNT)
-  # ============================================================
   worker:
     runs-on: ubuntu-latest
     strategy:
@@ -366,7 +346,6 @@ jobs:
 
       - name: Connect to next node via Holesail
         run: |
-          # Map next node's RPC port to a local port (e.g., 7000+rank)
           NEXT_PORT=$((7000 + WORKER_ID))
           holesail --connect "$NEXT_HOLESAIL_URL" --port $NEXT_PORT &
           sleep 5
@@ -378,7 +357,6 @@ jobs:
         run: |
           cd prima.cpp
           RANK=$WORKER_ID
-          # Determine next: if last, next is master (port 6000), else next worker's local port
           if [ $WORKER_ID -eq $WORKER_COUNT ]; then
             NEXT="127.0.0.1:6000"
           else
