@@ -34,17 +34,30 @@ jobs:
                 -d "{\"message\":\"cleanup\",\"sha\":\"${sha}\"}" || true
             fi
           done
+
           for i in $(seq 1 $WORKER_COUNT); do
+            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/next_url_${i}.txt" 2>/dev/null)
+            SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
+            if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+              curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO}/contents/next_url_${i}.txt" \
+                -d "{\"message\":\"cleanup\",\"sha\":\"$SHA\"}" || true
+            fi
+          done
+
+          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/master_url.txt" 2>/dev/null)
+          SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
+          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
             curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/next_url_${i}.txt" \
-              -d "{\"message\":\"cleanup\"}" || true
-          done
-          # Also clean master_url.txt
-          curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/master_url.txt" \
-            -d "{\"message\":\"cleanup\"}" || true
+              "https://api.github.com/repos/${REPO}/contents/master_url.txt" \
+              -d "{\"message\":\"cleanup\",\"sha\":\"$SHA\"}" || true
+          fi
           echo "✅ Cleanup done."
 
       - name: Install system dependencies
@@ -98,24 +111,31 @@ jobs:
           echo "MASTER_HOLESAIL_URL=$MASTER_URL" >> $GITHUB_ENV
           echo "$MASTER_URL" > master_url.txt
           ENCODED=$(base64 -w0 master_url.txt)
-          # Check if file exists to get SHA
-          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/master_url.txt")
-          SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
-          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-            PAYLOAD=$(jq -n --arg msg "publish master url" --arg content "$ENCODED" --arg sha "$SHA" \
-              '{message: $msg, content: $content, sha: $sha}')
-          else
-            PAYLOAD=$(jq -n --arg msg "publish master url" --arg content "$ENCODED" \
-              '{message: $msg, content: $content}')
-          fi
-          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/master_url.txt" \
-            -d "$PAYLOAD" || true
 
-      - name: Wait for workers to register and publish their URLs
+          for attempt in {1..5}; do
+            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/master_url.txt")
+            SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
+            if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+              PAYLOAD=$(jq -n --arg msg "publish master url" --arg content "$ENCODED" --arg sha "$SHA" \
+                '{message: $msg, content: $content, sha: $sha}')
+            else
+              PAYLOAD=$(jq -n --arg msg "publish master url" --arg content "$ENCODED" \
+                '{message: $msg, content: $content}')
+            fi
+            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/master_url.txt" \
+              -d "$PAYLOAD")
+            if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
+              echo "✅ Published master URL"
+              break
+            fi
+            if [ $attempt -lt 5 ]; then sleep 2; fi
+          done
+
+      - name: Wait for workers and build ring
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -146,7 +166,6 @@ jobs:
             exit 1
           fi
 
-          # Build ring: worker i → worker i+1, last → master
           for i in $(seq 1 $WORKER_COUNT); do
             NEXT_INDEX=$((i + 1))
             if [ $NEXT_INDEX -gt $WORKER_COUNT ]; then
@@ -157,32 +176,39 @@ jobs:
                 "https://api.github.com/repos/${REPO}/contents/workers/worker_${NEXT_INDEX}.txt" 2>/dev/null)
               NEXT_URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
               if [ -z "$NEXT_URL" ] || [ "$NEXT_URL" = "null" ]; then
-                echo "❌ Failed to get next URL for worker $i (next worker $NEXT_INDEX)"
+                echo "❌ Failed to get next URL for worker $i"
                 exit 1
               fi
             fi
             echo "$NEXT_URL" > next_url_${i}.txt
             ENCODED_NEXT=$(base64 -w0 next_url_${i}.txt)
-            # Check if file exists
-            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/next_url_${i}.txt")
-            SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
-            if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-              PAYLOAD=$(jq -n --arg msg "publish next url for worker $i" --arg content "$ENCODED_NEXT" --arg sha "$SHA" \
-                '{message: $msg, content: $content, sha: $sha}')
-            else
-              PAYLOAD=$(jq -n --arg msg "publish next url for worker $i" --arg content "$ENCODED_NEXT" \
-                '{message: $msg, content: $content}')
-            fi
-            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/next_url_${i}.txt" \
-              -d "$PAYLOAD" || true
+
+            for attempt in {1..5}; do
+              FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO}/contents/next_url_${i}.txt")
+              SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
+              if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+                PAYLOAD=$(jq -n --arg msg "publish next url for worker $i" --arg content "$ENCODED_NEXT" --arg sha "$SHA" \
+                  '{message: $msg, content: $content, sha: $sha}')
+              else
+                PAYLOAD=$(jq -n --arg msg "publish next url for worker $i" --arg content "$ENCODED_NEXT" \
+                  '{message: $msg, content: $content}')
+              fi
+              RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO}/contents/next_url_${i}.txt" \
+                -d "$PAYLOAD")
+              if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
+                echo "✅ Published next_url_${i}.txt"
+                break
+              fi
+              if [ $attempt -lt 5 ]; then sleep 2; fi
+            done
           done
           echo "✅ Published next URLs for all workers."
 
-      - name: Connect to worker 1 (the first in the ring) via Holesail
+      - name: Connect to worker 1 via Holesail
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -198,11 +224,11 @@ jobs:
           holesail --connect "$WORKER1_URL" --port 7001 &
           sleep 5
 
-      - name: Start prima.cpp master (rank 0)
+      - name: Start prima.cpp master (llama-server)
         run: |
           cd prima.cpp
           export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
-          nohup ./llama-cli \
+          nohup ./llama-server \
             -m ../models/model.gguf \
             -c 2048 \
             --world $((WORKER_COUNT + 1)) \
@@ -285,12 +311,12 @@ jobs:
           cd prima.cpp
           make USE_HIGHS=1 -j$(nproc)
 
-      - name: Download model (same as master)
+      - name: Download model
         run: |
           mkdir -p models
           curl -L -o models/model.gguf "$MODEL_URL" -f --retry 3
 
-      - name: Fetch master Holesail URL
+      - name: Fetch master URL
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -319,12 +345,12 @@ jobs:
           fi
           echo "MASTER_HOLESAIL_URL=$MASTER_URL" >> $GITHUB_ENV
 
-      - name: Connect to master via Holesail
+      - name: Connect to master
         run: |
           holesail --connect "$MASTER_HOLESAIL_URL" --port 6000 &
           sleep 5
 
-      - name: Expose worker RPC port and register
+      - name: Expose worker and register
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -338,22 +364,29 @@ jobs:
           mkdir -p workers
           echo "$WORKER_URL" > workers/worker_${WORKER_ID}.txt
           ENCODED=$(base64 -w0 workers/worker_${WORKER_ID}.txt)
-          # Check if file exists
-          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/workers/worker_${WORKER_ID}.txt")
-          SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
-          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-            PAYLOAD=$(jq -n --arg msg "register worker $WORKER_ID" --arg content "$ENCODED" --arg sha "$SHA" \
-              '{message: $msg, content: $content, sha: $sha}')
-          else
-            PAYLOAD=$(jq -n --arg msg "register worker $WORKER_ID" --arg content "$ENCODED" \
-              '{message: $msg, content: $content}')
-          fi
-          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/workers/worker_${WORKER_ID}.txt" \
-            -d "$PAYLOAD" || true
+
+          for attempt in {1..5}; do
+            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers/worker_${WORKER_ID}.txt")
+            SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
+            if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+              PAYLOAD=$(jq -n --arg msg "register worker $WORKER_ID" --arg content "$ENCODED" --arg sha "$SHA" \
+                '{message: $msg, content: $content, sha: $sha}')
+            else
+              PAYLOAD=$(jq -n --arg msg "register worker $WORKER_ID" --arg content "$ENCODED" \
+                '{message: $msg, content: $content}')
+            fi
+            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers/worker_${WORKER_ID}.txt" \
+              -d "$PAYLOAD")
+            if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
+              echo "✅ Worker $WORKER_ID registered"
+              break
+            fi
+            if [ $attempt -lt 5 ]; then sleep 2; fi
+          done
 
       - name: Fetch next URL and connect
         env:
@@ -384,13 +417,13 @@ jobs:
           fi
           echo "NEXT_HOLESAIL_URL=$NEXT_URL" >> $GITHUB_ENV
 
-      - name: Connect to next node via Holesail
+      - name: Connect to next node
         run: |
           NEXT_PORT=$((7000 + WORKER_ID))
           holesail --connect "$NEXT_HOLESAIL_URL" --port $NEXT_PORT &
           sleep 5
 
-      - name: Start prima.cpp worker
+      - name: Start prima.cpp worker (llama-cli)
         env:
           WORKER_ID: ${{ matrix.worker_id }}
           WORKER_COUNT: ${{ env.WORKER_COUNT }}
