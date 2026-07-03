@@ -1,4 +1,4 @@
-name: vLLM-Holesail Distributed CPU Mesh with Cloudflare
+name: vLLM-Holesail Distributed CPU Mesh (Pre-built Wheels)
 
 on:
   workflow_dispatch:
@@ -8,9 +8,9 @@ permissions:
   contents: write
 
 env:
-  WORKER_COUNT: 3                       # number of worker nodes (adjust as needed)
-  MODEL_ID: "Qwen/Qwen2.5-7B-Instruct"  # Hugging Face model ID
-  HEAD_REPO_FILE: "head_url.txt"        # file to share head's Holesail URL
+  WORKER_COUNT: 3
+  MODEL_ID: "Qwen/Qwen2.5-7B-Instruct"
+  HEAD_REPO_FILE: "head_url.txt"
 
 jobs:
   # ============================================================
@@ -24,22 +24,20 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y gcc-12 g++-12 libnuma-dev curl jq
-          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10 \
-            --slave /usr/bin/g++ g++ /usr/bin/g++-12
+          sudo apt-get install -y curl jq
           sudo npm install -g holesail
 
-      - name: Install Python and build tools
+      - name: Install uv (fast Python package manager)
         run: |
-          pip install --upgrade pip
-          pip install cmake>=3.26 wheel packaging ninja "setuptools-scm>=8" numpy
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-      - name: Build vLLM CPU backend
+      - name: Install vLLM CPU backend (pre-built wheel)
         run: |
-          git clone https://github.com/vllm-project/vllm.git
-          cd vllm
-          pip install -v -r requirements-cpu.txt --extra-index-url https://download.pytorch.org/whl/cpu
-          VLLM_TARGET_DEVICE=cpu python setup.py install
+          uv pip install vllm \
+            --extra-index-url https://wheels.vllm.ai/nightly/cpu \
+            --index-strategy first-index \
+            --torch-backend cpu
 
       - name: Start Ray Head and expose via Holesail
         env:
@@ -54,7 +52,6 @@ jobs:
           echo "$HEAD_URL" > head_url.txt
           ENCODED=$(base64 -w0 head_url.txt)
 
-          # Publish URL to repo so workers can fetch it
           curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/contents/${HEAD_REPO_FILE}" \
@@ -97,29 +94,27 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        worker_id: [1, 2, 3]   # adjust to match WORKER_COUNT
+        worker_id: [1, 2, 3]
     timeout-minutes: 360
 
     steps:
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y gcc-12 g++-12 libnuma-dev curl jq
-          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10 \
-            --slave /usr/bin/g++ g++ /usr/bin/g++-12
+          sudo apt-get install -y curl jq
           sudo npm install -g holesail
 
-      - name: Install Python and build tools
+      - name: Install uv (fast Python package manager)
         run: |
-          pip install --upgrade pip
-          pip install cmake>=3.26 wheel packaging ninja "setuptools-scm>=8" numpy
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-      - name: Build vLLM CPU backend
+      - name: Install vLLM CPU backend (pre-built wheel)
         run: |
-          git clone https://github.com/vllm-project/vllm.git
-          cd vllm
-          pip install -v -r requirements-cpu.txt --extra-index-url https://download.pytorch.org/whl/cpu
-          VLLM_TARGET_DEVICE=cpu python setup.py install
+          uv pip install vllm \
+            --extra-index-url https://wheels.vllm.ai/nightly/cpu \
+            --index-strategy first-index \
+            --torch-backend cpu
 
       - name: Fetch Head Node URL from repository
         env:
