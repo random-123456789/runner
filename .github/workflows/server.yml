@@ -1,4 +1,4 @@
-name: vLLM-Holesail Ray Mesh (P2P Pattern)
+name: vLLM P2P Ray Mesh (with Worker Registration)
 
 on:
   workflow_dispatch:
@@ -8,21 +8,36 @@ permissions:
   contents: write
 
 env:
-  WORKER_COUNT: 3
+  WORKER_COUNT: 3                       # change to 19 for full cluster
   MODEL_ID: "Qwen/Qwen2.5-7B-Instruct"
   HEAD_REPO_FILE: "head_url.txt"
 
 jobs:
-  head:
+  # ============================================================
+  # QUEEN (Head) – Ray Head, vLLM API, Cloudflare
+  # ============================================================
+  queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
-      - name: Clean up previous head_url.txt
+      - name: Clean previous head_url.txt and workers
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
+          echo "🧹 Cleaning workers/ directory..."
+          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
+          echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name + ":" + .sha' 2>/dev/null | while IFS=':' read -r name sha; do
+            if [ -n "$name" ] && [ -n "$sha" ]; then
+              curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO}/contents/workers/${name}" \
+                -d "{\"message\":\"cleanup\",\"sha\":\"${sha}\"}" || true
+            fi
+          done
           echo "🧹 Deleting previous head_url.txt..."
           RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
@@ -33,9 +48,7 @@ jobs:
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/${HEAD_REPO_FILE}" \
               -d "{\"message\":\"cleanup\",\"sha\":\"$SHA\"}"
-            echo "✅ Deleted old file"
-          else
-            echo "ℹ️ No existing file to delete"
+            echo "✅ Deleted old head_url.txt"
           fi
 
       - name: Install system dependencies
@@ -65,10 +78,11 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           source .venv/bin/activate
-          export RAY_NODE_IP=0.0.0.0
-          export RAY_GCS_ADDRESS=0.0.0.0:6379
-          export RAY_ADDRESS=0.0.0.0:6379
+          export RAY_NODE_IP=127.0.0.1
+          export RAY_GCS_ADDRESS=127.0.0.1:6379
+          export RAY_ADDRESS=127.0.0.1:6379
           ray start --head --port=6379 \
+            --node-ip-address=127.0.0.1 \
             --dashboard-host=127.0.0.1 \
             --disable-usage-stats
 
@@ -84,7 +98,37 @@ jobs:
             "https://api.github.com/repos/${REPO}/contents/${HEAD_REPO_FILE}" \
             -d "{\"message\":\"publish head url\",\"content\":\"$ENCODED\"}" || true
 
-      - name: Start vLLM API Server
+      # ---------- NEW: Wait for workers to register (like original pattern) ----------
+      - name: Wait for workers to register
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "👑 Queen waiting for $WORKER_COUNT workers..."
+          for attempt in {1..60}; do
+            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
+            if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
+              COUNT=0
+            else
+              FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
+              COUNT=$(echo "$FILES" | grep -c . || echo 0)
+            fi
+            echo "  Attempt $attempt: $COUNT/$WORKER_COUNT workers registered"
+            if [ "$COUNT" -ge $WORKER_COUNT ]; then
+              echo "✅ All workers registered!"
+              break
+            fi
+            sleep 5
+          done
+          if [ "$COUNT" -lt $WORKER_COUNT ]; then
+            echo "❌ Timeout waiting for workers"
+            exit 1
+          fi
+          # Note: We do NOT connect to workers; they will connect to us via Ray GCS.
+
+      - name: Start vLLM API Server (with health check)
         run: |
           source .venv/bin/activate
           python -m vllm.entrypoints.openai.api_server \
@@ -92,16 +136,26 @@ jobs:
             --dtype float16 \
             --tensor-parallel-size 1 \
             --distributed-executor-backend ray \
+            --host 0.0.0.0 \
             --port 8080 &
-          sleep 15
+          
+          echo "⏳ Waiting for vLLM server to be ready..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8080/health > /dev/null; then
+              echo "✅ vLLM server is ready"
+              break
+            fi
+            echo "  Attempt $i/30 – waiting for vLLM..."
+            sleep 5
+          done
 
-      - name: Expose API via Cloudflare Tunnel
+      - name: Expose API via Cloudflare Tunnel (port 8080)
         run: |
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x cloudflared
           fi
-          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8265 > tunnel.log 2>&1 &
+          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
           echo "⏳ Waiting for Cloudflare tunnel to be ready..."
           TUNNEL_URL=""
           for i in {1..30}; do
@@ -115,20 +169,21 @@ jobs:
             sleep 3
           done
           if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ Failed to get Cloudflare tunnel URL after 30 attempts."
-            echo "Last 20 lines of tunnel.log:"
+            echo "❌ Failed to get Cloudflare tunnel URL."
             tail -20 tunnel.log
-            # Don't exit – the API might still be accessible locally, but the tunnel isn't public.
           fi
-          
+
       - name: Keep alive
         run: sleep infinity
 
+  # ============================================================
+  # WORKERS – Fetch head URL, connect to Ray, and register own URL
+  # ============================================================
   worker:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        worker_id: [1, 2, 3]
+        worker_id: [1, 2, 3]   # change to 19 for full cluster
     timeout-minutes: 360
 
     steps:
@@ -153,12 +208,12 @@ jobs:
             --torch-backend cpu
           ray --version
 
-      - name: Fetch Head Node URL from repository
+      - name: Fetch Queen's Head URL from repository
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "📡 Fetching Head Node URL..."
+          echo "📡 Fetching Queen's Head URL..."
           HEAD_URL=""
           for attempt in {1..30}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
@@ -175,20 +230,65 @@ jobs:
               HEAD_URL="$URL"
               break
             fi
-            echo "  Waiting for Head Node to publish URL... ($attempt/30)"
+            echo "  Waiting for Queen to publish URL... ($attempt/30)"
             sleep 5
           done
           if [ -z "$HEAD_URL" ]; then
-            echo "❌ Failed to fetch Head Node URL"
+            echo "❌ Failed to fetch Queen's Head URL"
             exit 1
           fi
           echo "HEAD_NODE_URL=$HEAD_URL" >> $GITHUB_ENV
 
       - name: Connect to Ray Head via Holesail and start worker
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+          WORKER_ID: ${{ matrix.worker_id }}
         run: |
           source .venv/bin/activate
+
+          # Connect to head's Ray GCS
           holesail --connect "$HEAD_NODE_URL" --port 6379 &
           sleep 10
 
-          ray start --address=0.0.0.0:6379 --disable-usage-stats
+          # Start Ray worker with environment to force loopback
+          export RAY_NODE_IP=127.0.0.1
+          export RAY_GCS_ADDRESS=127.0.0.1:6379
+          export RAY_ADDRESS=127.0.0.1:6379
+          ray start --address=127.0.0.1:6379 --disable-usage-stats
+
+          # ---- Register this worker's own URL (so queen knows it's alive) ----
+          # We need to expose something? But we don't have a service to expose.
+          # Instead, we can just create a dummy file in workers/ with the worker ID.
+          # This signals to the queen that this worker is ready.
+          mkdir -p workers
+          echo "{\"status\": \"ready\", \"worker_id\": $WORKER_ID}" > workers/worker${WORKER_ID}.json
+          ENCODED=$(base64 -w0 workers/worker${WORKER_ID}.json)
+
+          for attempt in {1..10}; do
+            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers/worker${WORKER_ID}.json")
+            SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
+            if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+              PAYLOAD=$(jq -n --arg msg "register worker $WORKER_ID" \
+                --arg content "$ENCODED" --arg sha "$SHA" \
+                '{message: $msg, content: $content, sha: $sha}')
+            else
+              PAYLOAD=$(jq -n --arg msg "register worker $WORKER_ID" \
+                --arg content "$ENCODED" \
+                '{message: $msg, content: $content}')
+            fi
+            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers/worker${WORKER_ID}.json" \
+              -d "$PAYLOAD")
+            if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
+              echo "✅ Worker $WORKER_ID registered successfully!"
+              break
+            fi
+            sleep 3
+          done
+
+          # Keep alive
           sleep infinity
