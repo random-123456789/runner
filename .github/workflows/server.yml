@@ -13,9 +13,6 @@ env:
   HEAD_REPO_FILE: "head_url.txt"
 
 jobs:
-  # ============================================================
-  # HEAD NODE (Node 0) – API Server, Ray Head, Cloudflare Tunnel
-  # ============================================================
   head:
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -27,32 +24,27 @@ jobs:
           sudo apt-get install -y curl jq
           sudo npm install -g holesail
 
-      - name: Install uv (fast Python package manager)
+      - name: Install uv
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-      - name: Create virtual environment and install vLLM CPU backend
+      - name: Create venv and install vLLM + Ray
         run: |
           uv venv
           source .venv/bin/activate
-          uv pip install vllm \
+          uv pip install vllm ray \
             --extra-index-url https://wheels.vllm.ai/nightly/cpu \
             --index-strategy first-index \
             --torch-backend cpu
 
-      - name: Start Ray Head (bind to localhost) and expose via Holesail
+      - name: Start Ray Head and expose via Holesail
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
           source .venv/bin/activate
-          # Bind head to loopback so all traffic goes through Holesail tunnel
-          ray start --head --port=6379 \
-            --node-ip-address=127.0.0.1 \
-            --dashboard-host=127.0.0.1 \
-            --disable-usage-stats
-
+          ray start --head --port=6379 --dashboard-host=0.0.0.0
           holesail --live 6379 > /tmp/holesail_head.txt 2>&1 &
           sleep 5
           HEAD_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_head.txt | head -1)
@@ -96,9 +88,6 @@ jobs:
       - name: Keep alive
         run: sleep infinity
 
-  # ============================================================
-  # WORKER NODES – Connect to Ray Head via Holesail and join
-  # ============================================================
   worker:
     runs-on: ubuntu-latest
     strategy:
@@ -113,16 +102,16 @@ jobs:
           sudo apt-get install -y curl jq
           sudo npm install -g holesail
 
-      - name: Install uv (fast Python package manager)
+      - name: Install uv
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-      - name: Create virtual environment and install vLLM CPU backend
+      - name: Create venv and install vLLM + Ray
         run: |
           uv venv
           source .venv/bin/activate
-          uv pip install vllm \
+          uv pip install vllm ray \
             --extra-index-url https://wheels.vllm.ai/nightly/cpu \
             --index-strategy first-index \
             --torch-backend cpu
@@ -158,6 +147,5 @@ jobs:
           source .venv/bin/activate
           holesail --connect "$HEAD_NODE_URL" --port 6379 &
           sleep 10
-          # Ray now connects to localhost (tunneled to head)
           ray start --address="127.0.0.1:6379"
           sleep infinity
