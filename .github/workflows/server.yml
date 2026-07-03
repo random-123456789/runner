@@ -48,18 +48,18 @@ jobs:
             echo "✅ Deleted old head_url.txt"
           fi
 
-      - name: Install system dependencies
+      - name: Install system dependencies and Python 3.12
         run: |
-          brew install curl jq
+          brew install curl jq python@3.12
           sudo npm install -g holesail
 
-      - name: Install vLLM Metal from nightly wheels
+      - name: Install vLLM Metal from nightly wheels (Python 3.12)
         run: |
-          python3 -m venv ~/.venv-vllm-metal
+          python3.12 -m venv ~/.venv-vllm-metal
           source ~/.venv-vllm-metal/bin/activate
           pip install --upgrade pip
-          # Pre-built nightly wheel for Metal (fast, no compilation)
-          pip install vllm --extra-index-url https://wheels.vllm.ai/nightly/metal
+          # Use --index-url to only look at the nightly Metal index
+          pip install vllm --index-url https://wheels.vllm.ai/nightly/metal
           pip install ray[default]
 
       - name: Start Ray Head and expose via Holesail
@@ -175,17 +175,17 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Install system dependencies
+      - name: Install system dependencies and Python 3.12
         run: |
-          brew install curl jq
+          brew install curl jq python@3.12
           sudo npm install -g holesail
 
-      - name: Install vLLM Metal from nightly wheels
+      - name: Install vLLM Metal from nightly wheels (Python 3.12)
         run: |
-          python3 -m venv ~/.venv-vllm-metal
+          python3.12 -m venv ~/.venv-vllm-metal
           source ~/.venv-vllm-metal/bin/activate
           pip install --upgrade pip
-          pip install vllm --extra-index-url https://wheels.vllm.ai/nightly/metal
+          pip install vllm --index-url https://wheels.vllm.ai/nightly/metal
           pip install ray[default]
 
       - name: Fetch Head Node URL from repository
