@@ -236,7 +236,7 @@ jobs:
           cd prima.cpp
           export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
           WORLD=$((WORKER_COUNT + 1))
-          nohup ./llama-server \
+          ./llama-server \
             -m ../models/model.gguf \
             -c 2048 \
             --world $WORLD \
@@ -245,7 +245,7 @@ jobs:
             --next 127.0.0.1:7001 \
             --host 0.0.0.0 \
             --port 8080 \
-            > master.log 2>&1 &
+            &
 
       - name: Wait for master to be truly ready (200 OK)
         run: |
@@ -257,7 +257,7 @@ jobs:
               READY=true
               break
             fi
-            echo "⏳ Waiting... ($i/150)"
+            echo "⏳ Waiting... ($i/20)"
             sleep 2
             if [ $i -eq 30 ]; then
               echo "📄 master.log (last 20 lines):"
