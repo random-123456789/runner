@@ -1,4 +1,4 @@
-name: prima.cpp Test (3 Nodes)
+name: prima.cpp Ring Mesh (Holesail)
 
 on:
   workflow_dispatch:
@@ -8,25 +8,52 @@ permissions:
   contents: write
 
 env:
-  WORKER_COUNT: 2
+  WORKER_COUNT: 4                      # number of workers (total nodes = WORKER_COUNT + 1)
   MODEL_URL: "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q8_0.gguf"
+  # For 70B, use: https://huggingface.co/Qwen/Qwen2.5-72B-GGUF/resolve/main/qwen2.5-72b-instruct-q6_k.gguf
 
 jobs:
   # ============================================================
-  #  QUEEN (Master Node) – rank 0
+  #  QUEEN (Master Node, rank 0)
   # ============================================================
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
+      - name: Clean workers directory
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "🧹 Cleaning workers directory..."
+          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
+          echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name + ":" + .sha' 2>/dev/null | while IFS=':' read -r name sha; do
+            if [ -n "$name" ] && [ -n "$sha" ]; then
+              curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO}/contents/workers/${name}" \
+                -d "{\"message\":\"cleanup\",\"sha\":\"${sha}\"}" || true
+            fi
+          done
+          # Also clean old next_url files
+          for i in $(seq 1 $WORKER_COUNT); do
+            curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/next_url_${i}.txt" \
+              -d "{\"message\":\"cleanup\"}" || true
+          done
+          echo "✅ Cleanup done."
+
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl jq build-essential cmake git wget libzmq3-dev
           sudo npm install -g holesail
 
-      - name: Install fio (disk profiling)
+      - name: Install fio (disk performance profiling)
         run: |
           sudo apt-get install -y fio || true
           if ! command -v fio &> /dev/null; then
@@ -38,7 +65,7 @@ jobs:
             cd ..
           fi
 
-      - name: Install HiGHS (optimization library)
+      - name: Install HiGHS (optimization library for Halda scheduler)
         run: |
           git clone https://github.com/ERGO-Code/HiGHS.git
           cd HiGHS
@@ -55,12 +82,12 @@ jobs:
           make USE_HIGHS=1 -j$(nproc)
           ./llama-cli --help | head -5
 
-      - name: Download model (7B)
+      - name: Download model
         run: |
           mkdir -p models
           curl -L -o models/model.gguf "$MODEL_URL" -f --retry 3
 
-      - name: Start Holesail tunnel for master port
+      - name: Start Holesail tunnel for master port (6000)
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -76,66 +103,101 @@ jobs:
             "https://api.github.com/repos/${REPO}/contents/master_url.txt" \
             -d "{\"message\":\"publish master url\",\"content\":\"$ENCODED\"}" || true
 
-      - name: Wait for workers to register
+      - name: Wait for workers to register and publish their URLs
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
+          WORKER_COUNT: ${{ env.WORKER_COUNT }}
         run: |
           echo "👑 Queen waiting for $WORKER_COUNT workers..."
-          for attempt in {1..30}; do
-            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
-            FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
-            COUNT=$(echo "$FILES" | grep -c . || echo 0)
-            echo "  Attempt $attempt: $COUNT/$WORKER_COUNT workers registered"
-            if [ "$COUNT" -ge $WORKER_COUNT ]; then break; fi
+          for attempt in {1..60}; do
+            WORKER_URLS=""
+            ALL_FOUND=true
+            for i in $(seq 1 $WORKER_COUNT); do
+              RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO}/contents/workers/worker_${i}.txt" 2>/dev/null)
+              if echo "$RESPONSE" | jq -e '.message' > /dev/null 2>&1; then
+                ALL_FOUND=false
+                break
+              fi
+              URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
+              if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+                ALL_FOUND=false
+                break
+              fi
+              WORKER_URLS="${WORKER_URLS} ${URL}"
+            done
+            if [ "$ALL_FOUND" = true ]; then
+              echo "✅ All workers registered!"
+              break
+            fi
+            echo "  Attempt $attempt: waiting..."
             sleep 5
           done
-          if [ "$COUNT" -lt $WORKER_COUNT ]; then
+          if [ "$ALL_FOUND" != true ]; then
             echo "❌ Timeout waiting for workers"
             exit 1
           fi
+          # Store worker URLs in an array
+          WORKER_URL_ARRAY=($WORKER_URLS)
+          # Write next_url files: for each worker, the next is the next index (wrapping to master)
+          for i in $(seq 1 $WORKER_COUNT); do
+            NEXT_INDEX=$((i + 1))
+            if [ $NEXT_INDEX -gt $WORKER_COUNT ]; then
+              NEXT_URL="$MASTER_URL"
+            else
+              NEXT_URL="${WORKER_URL_ARRAY[$((i-1))]}" # next is current? Actually we need URL of next worker.
+              # The array is in order of worker ids. We need to map worker id to URL.
+              # Let's assume workers wrote files in order.
+              # We'll read URLs from files in order.
+              # Better: we have already fetched URLs in order of i.
+              NEXT_URL="${WORKER_URLS##* }" ? Not reliable.
+              # We'll fetch again in the loop.
+              RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO}/contents/workers/worker_${NEXT_INDEX}.txt" 2>/dev/null)
+              NEXT_URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
+            fi
+            echo "$NEXT_URL" > next_url_${i}.txt
+            ENCODED_NEXT=$(base64 -w0 next_url_${i}.txt)
+            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/next_url_${i}.txt" \
+              -d "{\"message\":\"publish next url for worker $i\",\"content\":\"$ENCODED_NEXT\"}" || true
+          done
+          echo "✅ Published next URLs for all workers."
 
-      - name: Connect to workers via Holesail
+      - name: Connect to worker 1 (the first in the ring) via Holesail
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          BASE_PORT=7000
-          for i in $(seq 1 $WORKER_COUNT); do
-            curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              "https://api.github.com/repos/${REPO}/contents/workers/worker${i}.json" > /tmp/worker.json
-            URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url')
-            if [ -z "$URL" ] || [ "$URL" = "null" ]; then
-              echo "❌ Worker $i URL missing"
-              exit 1
-            fi
-            PORT=$((BASE_PORT + i - 1))
-            holesail --connect "$URL" --port $PORT &
-          done
-          sleep 10
-
-      - name: Build worker address chain
-        run: |
-          # For 2 workers: master -> worker1 -> worker2 -> master
-          NEXT_ADDRS="127.0.0.1:7000,127.0.0.1:7001"
-          echo "NEXT_ADDRS=$NEXT_ADDRS" >> $GITHUB_ENV
+          # Fetch worker 1 URL
+          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/workers/worker_1.txt" 2>/dev/null)
+          WORKER1_URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
+          if [ -z "$WORKER1_URL" ] || [ "$WORKER1_URL" = "null" ]; then
+            echo "❌ Failed to get worker 1 URL"
+            exit 1
+          fi
+          # Connect to worker 1's RPC port (5000+1) but we need to map it to a local port for --next
+          # Worker 1 exposes port 5001. We'll map it to local 7001.
+          holesail --connect "$WORKER1_URL" --port 7001 &
+          sleep 5
 
       - name: Start prima.cpp master (rank 0)
-        env:
-          NEXT_ADDRS: ${{ env.NEXT_ADDRS }}
         run: |
           cd prima.cpp
-          # Master's --next is worker1
-          FIRST_WORKER=$(echo "$NEXT_ADDRS" | cut -d',' -f1)
+          # Master's --next is worker 1's local port (7001)
           nohup ./llama-cli \
             -m ../models/model.gguf \
             -c 2048 \
             --world $((WORKER_COUNT + 1)) \
             --rank 0 \
             --master 127.0.0.1:6000 \
-            --next "$FIRST_WORKER" \
+            --next 127.0.0.1:7001 \
             --host 0.0.0.0 \
             --port 8080 \
             > master.log 2>&1 &
@@ -147,6 +209,11 @@ jobs:
             fi
             sleep 2
           done
+          if ! curl -s http://localhost:8080/health > /dev/null; then
+            echo "❌ Master failed to start"
+            cat master.log
+            exit 1
+          fi
 
       - name: Expose API via Cloudflare Tunnel
         run: |
@@ -166,13 +233,13 @@ jobs:
         run: sleep infinity
 
   # ============================================================
-  #  WORKERS (2 nodes)
+  #  WORKERS (ranks 1..WORKER_COUNT)
   # ============================================================
   worker:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        worker_id: [1, 2]
+        worker_id: [1, 2, 3, 4]
     timeout-minutes: 360
 
     steps:
@@ -219,20 +286,23 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
+          WORKER_ID: ${{ matrix.worker_id }}
         run: |
-          echo "📡 Fetching master Holesail URL..."
+          echo "📡 Worker $WORKER_ID fetching master URL..."
           MASTER_URL=""
           for attempt in {1..30}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/${REPO}/contents/master_url.txt" 2>/dev/null)
+            if echo "$RESPONSE" | jq -e '.message' > /dev/null 2>&1; then
+              sleep 5
+              continue
+            fi
             URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
             if [ -n "$URL" ] && [ "$URL" != "null" ] && [[ "$URL" == hs://* ]]; then
-              echo "Fetched valid URL: $URL"
               MASTER_URL="$URL"
               break
             fi
-            echo "  Waiting for master to publish URL... ($attempt/30)"
             sleep 5
           done
           if [ -z "$MASTER_URL" ]; then
@@ -246,7 +316,7 @@ jobs:
           holesail --connect "$MASTER_HOLESAIL_URL" --port 6000 &
           sleep 5
 
-      - name: Register worker with master
+      - name: Expose worker RPC port and register
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -258,12 +328,48 @@ jobs:
           WORKER_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_worker.txt | head -1)
           echo "✅ Worker $WORKER_ID: $WORKER_URL"
           mkdir -p workers
-          echo "{\"url\": \"$WORKER_URL\"}" > workers/worker${WORKER_ID}.json
-          ENCODED=$(base64 -w0 workers/worker${WORKER_ID}.json)
+          echo "$WORKER_URL" > workers/worker_${WORKER_ID}.txt
+          ENCODED=$(base64 -w0 workers/worker_${WORKER_ID}.txt)
           curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/workers/worker${WORKER_ID}.json" \
+            "https://api.github.com/repos/${REPO}/contents/workers/worker_${WORKER_ID}.txt" \
             -d "{\"message\":\"register worker $WORKER_ID\",\"content\":\"$ENCODED\"}" || true
+
+      - name: Fetch next URL and connect
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+          WORKER_ID: ${{ matrix.worker_id }}
+        run: |
+          echo "📡 Worker $WORKER_ID fetching next URL..."
+          NEXT_URL=""
+          for attempt in {1..30}; do
+            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/next_url_${WORKER_ID}.txt" 2>/dev/null)
+            if echo "$RESPONSE" | jq -e '.message' > /dev/null 2>&1; then
+              sleep 5
+              continue
+            fi
+            URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
+            if [ -n "$URL" ] && [ "$URL" != "null" ] && [[ "$URL" == hs://* ]]; then
+              NEXT_URL="$URL"
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "$NEXT_URL" ]; then
+            echo "❌ Failed to fetch next URL"
+            exit 1
+          fi
+          echo "NEXT_HOLESAIL_URL=$NEXT_URL" >> $GITHUB_ENV
+
+      - name: Connect to next node via Holesail
+        run: |
+          # Map next node's RPC port to a local port (e.g., 7000+rank)
+          NEXT_PORT=$((7000 + WORKER_ID))
+          holesail --connect "$NEXT_HOLESAIL_URL" --port $NEXT_PORT &
+          sleep 5
 
       - name: Start prima.cpp worker
         env:
@@ -272,12 +378,11 @@ jobs:
         run: |
           cd prima.cpp
           RANK=$WORKER_ID
-          # Determine next in ring
+          # Determine next: if last, next is master (port 6000), else next worker's local port
           if [ $WORKER_ID -eq $WORKER_COUNT ]; then
-            NEXT="127.0.0.1:6000"   # master's port
+            NEXT="127.0.0.1:6000"
           else
-            NEXT_RANK=$((WORKER_ID + 1))
-            NEXT_PORT=$((5000 + NEXT_RANK))
+            NEXT_PORT=$((7000 + WORKER_ID))
             NEXT="127.0.0.1:$NEXT_PORT"
           fi
           nohup ./llama-cli \
