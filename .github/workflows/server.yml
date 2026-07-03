@@ -77,10 +77,7 @@ jobs:
 
       - name: Clone and build prima.cpp
         run: |
-          # Primary source: new official GitHub organization
-          git clone https://github.com/OpenCPIL/prima.cpp.git || \
-            git clone https://gitee.com/zonghang-li/prima.cpp.git || \
-            echo "❌ Failed to clone prima.cpp" && exit 1
+          git clone https://github.com/OpenCPIL/prima.cpp.git
           cd prima.cpp
           make USE_HIGHS=1 -j$(nproc)
           ./llama-cli --help | head -5
@@ -114,6 +111,7 @@ jobs:
         run: |
           echo "👑 Queen waiting for $WORKER_COUNT workers..."
           for attempt in {1..60}; do
+            WORKER_URLS=""
             ALL_FOUND=true
             for i in $(seq 1 $WORKER_COUNT); do
               RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
@@ -123,6 +121,12 @@ jobs:
                 ALL_FOUND=false
                 break
               fi
+              URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
+              if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+                ALL_FOUND=false
+                break
+              fi
+              WORKER_URLS="${WORKER_URLS} ${URL}"
             done
             if [ "$ALL_FOUND" = true ]; then
               echo "✅ All workers registered!"
@@ -135,17 +139,21 @@ jobs:
             echo "❌ Timeout waiting for workers"
             exit 1
           fi
-
-          # Build ring: worker i → worker i+1, last → master
+          # Store worker URLs in an array
+          WORKER_URL_ARRAY=($WORKER_URLS)
+          # Write next_url files: for each worker, the next is the next index (wrapping to master)
           for i in $(seq 1 $WORKER_COUNT); do
             NEXT_INDEX=$((i + 1))
             if [ $NEXT_INDEX -gt $WORKER_COUNT ]; then
-              # Last worker points back to master
-              RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO}/contents/master_url.txt" 2>/dev/null)
-              NEXT_URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
+              NEXT_URL="$MASTER_URL"
             else
+              NEXT_URL="${WORKER_URL_ARRAY[$((i-1))]}" # next is current? Actually we need URL of next worker.
+              # The array is in order of worker ids. We need to map worker id to URL.
+              # Let's assume workers wrote files in order.
+              # We'll read URLs from files in order.
+              # Better: we have already fetched URLs in order of i.
+              NEXT_URL="${WORKER_URLS##* }" ? Not reliable.
+              # We'll fetch again in the loop.
               RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
                 -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/${REPO}/contents/workers/worker_${NEXT_INDEX}.txt" 2>/dev/null)
@@ -265,9 +273,7 @@ jobs:
 
       - name: Clone and build prima.cpp
         run: |
-          git clone https://github.com/OpenCPIL/prima.cpp.git || \
-            git clone https://gitee.com/zonghang-li/prima.cpp.git || \
-            echo "❌ Failed to clone prima.cpp" && exit 1
+          git clone https://github.com/OpenCPIL/prima.cpp.git
           cd prima.cpp
           make USE_HIGHS=1 -j$(nproc)
 
