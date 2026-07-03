@@ -255,7 +255,7 @@ jobs:
           export RAY_NODE_IP=127.0.0.1
           export RAY_GCS_ADDRESS=127.0.0.1:6379
           export RAY_ADDRESS=127.0.0.1:6379
-          ray start --address=127.0.0.1:6379 --disable-usage-stats
+          ray start --address=0.0.0.0:6379 --disable-usage-stats
 
           # ---- Register this worker's own URL (so queen knows it's alive) ----
           # We need to expose something? But we don't have a service to expose.
