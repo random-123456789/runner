@@ -1,4 +1,4 @@
-name: vLLM-Ray-Holesail Speculative Mesh (CPU)
+name: prima.cpp Test (3 Nodes)
 
 on:
   workflow_dispatch:
@@ -8,116 +8,146 @@ permissions:
   contents: write
 
 env:
-  WORKER_COUNT: 3                    # Change to 19 for full cluster
-  MODEL_ID: "Qwen/Qwen2.5-7B-Instruct"
-  HEAD_REPO_FILE: "head_url.txt"
+  WORKER_COUNT: 2
+  MODEL_URL: "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q8_0.gguf"
 
 jobs:
   # ============================================================
-  # HEAD NODE (Queen) – Ray head + vLLM server
+  #  QUEEN (Master Node) – rank 0
   # ============================================================
-  head:
+  queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-  
+
     steps:
-      - name: Clean up previous head_url.txt
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          echo "🧹 Deleting previous head_url.txt..."
-          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/${HEAD_REPO_FILE}" 2>/dev/null)
-          SHA=$(echo "$RESPONSE" | jq -r '.sha' 2>/dev/null)
-          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-            curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/${HEAD_REPO_FILE}" \
-              -d "{\"message\":\"cleanup\",\"sha\":\"$SHA\"}"
-            echo "✅ Deleted old file"
-          else
-            echo "ℹ️ No existing file to delete"
-          fi
-  
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl jq
+          sudo apt-get install -y curl jq build-essential cmake git wget libzmq3-dev
           sudo npm install -g holesail
-  
-      - name: Install uv
+
+      - name: Install fio (disk profiling)
         run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-  
-      - name: Install vLLM + Ray (CPU)
+          sudo apt-get install -y fio || true
+          if ! command -v fio &> /dev/null; then
+            git clone https://github.com/axboe/fio.git
+            cd fio
+            ./configure --prefix=/usr
+            make -j$(nproc)
+            sudo make install
+            cd ..
+          fi
+
+      - name: Install HiGHS (optimization library)
         run: |
-          uv venv
-          source .venv/bin/activate
-          uv pip install vllm ray[default] \
-            --extra-index-url https://wheels.vllm.ai/nightly/cpu \
-            --index-strategy first-index \
-            --torch-backend cpu
-          ray --version
-  
-      - name: Start Ray Head and expose via Holesail
+          git clone https://github.com/ERGO-Code/HiGHS.git
+          cd HiGHS
+          mkdir build && cd build
+          cmake ..
+          make -j$(nproc)
+          sudo make install
+          cd ../..
+
+      - name: Clone and build prima.cpp
+        run: |
+          git clone https://github.com/Lizonghang/prima.cpp.git
+          cd prima.cpp
+          make USE_HIGHS=1 -j$(nproc)
+          ./llama-cli --help | head -5
+
+      - name: Download model (7B)
+        run: |
+          mkdir -p models
+          curl -L -o models/model.gguf "$MODEL_URL" -f --retry 3
+
+      - name: Start Holesail tunnel for master port
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          source .venv/bin/activate
-          # Start Ray head with 4 CPUs
-          ray start --head --port=6379 --num-cpus=4 --disable-usage-stats
-          # Expose the port via Holesail
-          holesail --live 6379 > /tmp/holesail_head.txt 2>&1 &
+          holesail --live 6000 > /tmp/holesail_master.txt 2>&1 &
           sleep 5
-          HEAD_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_head.txt | head -1)
-          echo "HEAD_NODE_URL=$HEAD_URL" >> $GITHUB_ENV
-          echo "$HEAD_URL" > head_url.txt
-          ENCODED=$(base64 -w0 head_url.txt)
+          MASTER_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_master.txt | head -1)
+          echo "MASTER_HOLESAIL_URL=$MASTER_URL" >> $GITHUB_ENV
+          echo "$MASTER_URL" > master_url.txt
+          ENCODED=$(base64 -w0 master_url.txt)
           curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/${HEAD_REPO_FILE}" \
-            -d "{\"message\":\"publish head url\",\"content\":\"$ENCODED\"}" || true
-  
-      - name: Wait for workers to join the Ray cluster
+            "https://api.github.com/repos/${REPO}/contents/master_url.txt" \
+            -d "{\"message\":\"publish master url\",\"content\":\"$ENCODED\"}" || true
+
+      - name: Wait for workers to register
         env:
-          WORKER_COUNT: ${{ env.WORKER_COUNT }}
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
-          source .venv/bin/activate
-          echo "⏳ Waiting for $WORKER_COUNT workers to join..."
-          for attempt in {1..60}; do
-            NODES=$(ray status 2>/dev/null | grep -c "node" || echo 0)
-            echo "  Attempt $attempt: $NODES nodes connected"
-            if [ "$NODES" -ge $((WORKER_COUNT + 1)) ]; then  # +1 for head node
-              echo "✅ All workers joined!"
-              break
-            fi
+          echo "👑 Queen waiting for $WORKER_COUNT workers..."
+          for attempt in {1..30}; do
+            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
+            FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
+            COUNT=$(echo "$FILES" | grep -c . || echo 0)
+            echo "  Attempt $attempt: $COUNT/$WORKER_COUNT workers registered"
+            if [ "$COUNT" -ge $WORKER_COUNT ]; then break; fi
             sleep 5
           done
-          if [ "$NODES" -lt $((WORKER_COUNT + 1)) ]; then
-            echo "❌ Not all workers joined within timeout"
+          if [ "$COUNT" -lt $WORKER_COUNT ]; then
+            echo "❌ Timeout waiting for workers"
             exit 1
           fi
-  
-      - name: Start vLLM API Server with low memory settings
+
+      - name: Connect to workers via Holesail
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
-          source .venv/bin/activate
-          # Reduce memory usage
-          export VLLM_CPU_KVCACHE_SPACE=4    # 4 GiB KV cache
-          # Start vLLM with low memory utilization and smaller context
-          python -m vllm.entrypoints.openai.api_server \
-            --model $MODEL_ID \
-            --dtype float16 \
-            --tensor-parallel-size 1 \
-            --distributed-executor-backend ray \
-            --gpu-memory-utilization 0.5 \   # controls CPU memory fraction
-            --max-model-len 4096 \            # reduce context size to save memory
-            --port 8080 &
-          sleep 15
-  
+          BASE_PORT=7000
+          for i in $(seq 1 $WORKER_COUNT); do
+            curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${REPO}/contents/workers/worker${i}.json" > /tmp/worker.json
+            URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url')
+            if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+              echo "❌ Worker $i URL missing"
+              exit 1
+            fi
+            PORT=$((BASE_PORT + i - 1))
+            holesail --connect "$URL" --port $PORT &
+          done
+          sleep 10
+
+      - name: Build worker address chain
+        run: |
+          # For 2 workers: master -> worker1 -> worker2 -> master
+          NEXT_ADDRS="127.0.0.1:7000,127.0.0.1:7001"
+          echo "NEXT_ADDRS=$NEXT_ADDRS" >> $GITHUB_ENV
+
+      - name: Start prima.cpp master (rank 0)
+        env:
+          NEXT_ADDRS: ${{ env.NEXT_ADDRS }}
+        run: |
+          cd prima.cpp
+          # Master's --next is worker1
+          FIRST_WORKER=$(echo "$NEXT_ADDRS" | cut -d',' -f1)
+          nohup ./llama-cli \
+            -m ../models/model.gguf \
+            -c 2048 \
+            --world $((WORKER_COUNT + 1)) \
+            --rank 0 \
+            --master 127.0.0.1:6000 \
+            --next "$FIRST_WORKER" \
+            --host 0.0.0.0 \
+            --port 8080 \
+            > master.log 2>&1 &
+
+          for i in {1..60}; do
+            if curl -s http://localhost:8080/health > /dev/null; then
+              echo "✅ prima.cpp master ready"
+              break
+            fi
+            sleep 2
+          done
+
       - name: Expose API via Cloudflare Tunnel
         run: |
           if [ ! -f ./cloudflared ]; then
@@ -125,89 +155,140 @@ jobs:
             chmod +x cloudflared
           fi
           nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
-          echo "⏳ Waiting for Cloudflare tunnel..."
-          TUNNEL_URL=""
-          for i in {1..30}; do
-            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$TUNNEL_URL" ]; then
-              echo "✅ Public API URL: $TUNNEL_URL"
-              echo "::notice::API available at $TUNNEL_URL"
-              break
-            fi
-            sleep 3
-          done
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ Tunnel failed – API is local only."
+          sleep 5
+          TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+          if [ -n "$TUNNEL_URL" ]; then
+            echo "✅ Public API: $TUNNEL_URL"
+            echo "::notice::API available at $TUNNEL_URL"
           fi
-  
+
       - name: Keep alive
         run: sleep infinity
+
   # ============================================================
-  # WORKER NODES – join the Ray cluster
+  #  WORKERS (2 nodes)
   # ============================================================
   worker:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        worker_id: [1, 2, 3]   # Change to 19 for full cluster
+        worker_id: [1, 2]
     timeout-minutes: 360
 
     steps:
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl jq
+          sudo apt-get install -y curl jq build-essential cmake git wget libzmq3-dev
           sudo npm install -g holesail
-      - name: Install uv
+
+      - name: Install fio
         run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-      - name: Install vLLM + Ray (CPU)
+          sudo apt-get install -y fio || true
+          if ! command -v fio &> /dev/null; then
+            git clone https://github.com/axboe/fio.git
+            cd fio
+            ./configure --prefix=/usr
+            make -j$(nproc)
+            sudo make install
+            cd ..
+          fi
+
+      - name: Install HiGHS
         run: |
-          uv venv
-          source .venv/bin/activate
-          uv pip install vllm ray[default] \
-            --extra-index-url https://wheels.vllm.ai/nightly/cpu \
-            --index-strategy first-index \
-            --torch-backend cpu
-          ray --version
-      - name: Fetch Head Node URL from repository
+          git clone https://github.com/ERGO-Code/HiGHS.git
+          cd HiGHS
+          mkdir build && cd build
+          cmake ..
+          make -j$(nproc)
+          sudo make install
+          cd ../..
+
+      - name: Clone and build prima.cpp
+        run: |
+          git clone https://github.com/Lizonghang/prima.cpp.git
+          cd prima.cpp
+          make USE_HIGHS=1 -j$(nproc)
+
+      - name: Download model (same as master)
+        run: |
+          mkdir -p models
+          curl -L -o models/model.gguf "$MODEL_URL" -f --retry 3
+
+      - name: Fetch master Holesail URL
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "📡 Fetching Head Node URL..."
-          HEAD_URL=""
+          echo "📡 Fetching master Holesail URL..."
+          MASTER_URL=""
           for attempt in {1..30}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/${HEAD_REPO_FILE}" 2>/dev/null)
-            if echo "$RESPONSE" | jq -e '.message' > /dev/null 2>&1; then
-              echo "  File not yet published, retrying..."
-              sleep 5
-              continue
-            fi
+              "https://api.github.com/repos/${REPO}/contents/master_url.txt" 2>/dev/null)
             URL=$(echo "$RESPONSE" | jq -r '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '\n\r')
             if [ -n "$URL" ] && [ "$URL" != "null" ] && [[ "$URL" == hs://* ]]; then
               echo "Fetched valid URL: $URL"
-              HEAD_URL="$URL"
+              MASTER_URL="$URL"
               break
             fi
-            echo "  Waiting for Head Node to publish URL... ($attempt/30)"
+            echo "  Waiting for master to publish URL... ($attempt/30)"
             sleep 5
           done
-          if [ -z "$HEAD_URL" ]; then
-            echo "❌ Failed to fetch Head Node URL"
+          if [ -z "$MASTER_URL" ]; then
+            echo "❌ Failed to fetch master URL"
             exit 1
           fi
-          echo "HEAD_NODE_URL=$HEAD_URL" >> $GITHUB_ENV
-      - name: Connect to Ray Head via Holesail and start worker
+          echo "MASTER_HOLESAIL_URL=$MASTER_URL" >> $GITHUB_ENV
+
+      - name: Connect to master via Holesail
         run: |
-          source .venv/bin/activate
-          # Tunnel the head's port 6379 to localhost:6379
-          holesail --connect "$HEAD_NODE_URL" --port 6379 &
-          sleep 10
-          # Connect to the Ray cluster using the local tunnel
-          ray start --address=0.0.0.0:6379 --num-cpus=4 --disable-usage-stats
-          # Keep alive
-          sleep infinity
+          holesail --connect "$MASTER_HOLESAIL_URL" --port 6000 &
+          sleep 5
+
+      - name: Register worker with master
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+          WORKER_ID: ${{ matrix.worker_id }}
+        run: |
+          RPC_PORT=$((5000 + WORKER_ID))
+          holesail --live $RPC_PORT > /tmp/holesail_worker.txt 2>&1 &
+          sleep 5
+          WORKER_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_worker.txt | head -1)
+          echo "✅ Worker $WORKER_ID: $WORKER_URL"
+          mkdir -p workers
+          echo "{\"url\": \"$WORKER_URL\"}" > workers/worker${WORKER_ID}.json
+          ENCODED=$(base64 -w0 workers/worker${WORKER_ID}.json)
+          curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/workers/worker${WORKER_ID}.json" \
+            -d "{\"message\":\"register worker $WORKER_ID\",\"content\":\"$ENCODED\"}" || true
+
+      - name: Start prima.cpp worker
+        env:
+          WORKER_ID: ${{ matrix.worker_id }}
+          WORKER_COUNT: ${{ env.WORKER_COUNT }}
+        run: |
+          cd prima.cpp
+          RANK=$WORKER_ID
+          # Determine next in ring
+          if [ $WORKER_ID -eq $WORKER_COUNT ]; then
+            NEXT="127.0.0.1:6000"   # master's port
+          else
+            NEXT_RANK=$((WORKER_ID + 1))
+            NEXT_PORT=$((5000 + NEXT_RANK))
+            NEXT="127.0.0.1:$NEXT_PORT"
+          fi
+          nohup ./llama-cli \
+            -m ../models/model.gguf \
+            -c 2048 \
+            --world $((WORKER_COUNT + 1)) \
+            --rank $RANK \
+            --master 127.0.0.1:6000 \
+            --next "$NEXT" \
+            --prefetch \
+            > worker.log 2>&1 &
+
+      - name: Keep alive
+        run: sleep infinity
