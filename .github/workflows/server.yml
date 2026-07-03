@@ -209,6 +209,6 @@ jobs:
           holesail --connect "$HEAD_NODE_URL" --port 6379 &
           sleep 10
           # Connect to the Ray cluster using the local tunnel
-          ray start --address=127.0.0.1:6379 --num-cpus=4 --disable-usage-stats
+          ray start --address=0.0.0.0:6379 --num-cpus=4 --disable-usage-stats
           # Keep alive
           sleep infinity
