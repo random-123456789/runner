@@ -1,4 +1,4 @@
-name: vLLM Metal Cluster (mp backend + optional workers)
+name: vLLM Metal Cluster (mp backend + workers)
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ env:
 
 jobs:
   # ============================================================
-  # HEAD – vLLM API Server (local multiprocessing, no Ray)
+  # HEAD – vLLM API Server (local multiprocessing)
   # ============================================================
   head:
     runs-on: macos-26
@@ -49,18 +49,17 @@ jobs:
               -d "{\"message\":\"cleanup\",\"sha\":\"$SHA\"}"
           fi
 
-      - name: Install system dependencies and Python 3.12
+      - name: Install system dependencies
         run: |
-          brew install curl jq python@3.12
+          brew install curl jq
           sudo npm install -g holesail
 
-      - name: Install vLLM Metal (direct wheel)
+      - name: Install vLLM Metal via official install script
         run: |
-          python3.12 -m venv ~/.venv-vllm-metal
+          curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
+          # Verify installation
           source ~/.venv-vllm-metal/bin/activate
-          pip install --upgrade pip
-          pip install https://github.com/vllm-project/vllm-metal/releases/download/v0.3.0.dev20260703134307/vllm_metal-0.3.0.dev20260703134307-cp312-cp312-macosx_11_0_arm64.whl
-          # No Ray needed – just vLLM
+          python -c "import vllm; print(vllm.__version__)"
 
       - name: Start vLLM API Server (mp backend)
         run: |
@@ -92,7 +91,8 @@ jobs:
           echo "⏳ Waiting for Cloudflare tunnel..."
           TUNNEL_URL=""
           for i in {1..30}; do
-            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            # macOS grep uses -E for extended regex, not -P
+            TUNNEL_URL=$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$TUNNEL_URL" ]; then
               echo "✅ Public API URL: $TUNNEL_URL"
               echo "::notice::API available at $TUNNEL_URL"
@@ -108,7 +108,7 @@ jobs:
         run: sleep infinity
 
   # ============================================================
-  # OPTIONAL WORKERS – Data parallelism (each runs its own vLLM)
+  # WORKERS – Data parallelism (each runs its own vLLM)
   # ============================================================
   worker:
     runs-on: macos-26
@@ -118,17 +118,16 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Install system dependencies and Python 3.12
+      - name: Install system dependencies
         run: |
-          brew install curl jq python@3.12
+          brew install curl jq
           sudo npm install -g holesail
 
-      - name: Install vLLM Metal (direct wheel)
+      - name: Install vLLM Metal via official install script
         run: |
-          python3.12 -m venv ~/.venv-vllm-metal
+          curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
           source ~/.venv-vllm-metal/bin/activate
-          pip install --upgrade pip
-          pip install https://github.com/vllm-project/vllm-metal/releases/download/v0.3.0.dev20260703134307/vllm_metal-0.3.0.dev20260703134307-cp312-cp312-macosx_11_0_arm64.whl
+          python -c "import vllm; print(vllm.__version__)"
 
       - name: Start vLLM API Server and expose via Holesail
         env:
@@ -155,12 +154,13 @@ jobs:
 
           holesail --live ${PORT} > /tmp/holesail_worker.txt 2>&1 &
           sleep 5
-          WORKER_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_worker.txt | head -1)
+          WORKER_URL=$(grep -Eo 'hs://[a-zA-Z0-9]+' /tmp/holesail_worker.txt | head -1)
           echo "✅ Worker $WORKER_ID Holesail URL: $WORKER_URL"
 
           mkdir -p workers
           echo "{\"url\": \"${WORKER_URL}\"}" > workers/worker${WORKER_ID}.json
-          ENCODED=$(base64 -w0 workers/worker${WORKER_ID}.json)
+          # macOS base64 uses -b 0 for no line breaks (equivalent to -w0 on GNU)
+          ENCODED=$(base64 -b 0 workers/worker${WORKER_ID}.json)
 
           for attempt in {1..10}; do
             FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
