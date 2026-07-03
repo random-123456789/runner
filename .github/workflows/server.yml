@@ -152,7 +152,7 @@ jobs:
               # Let's assume workers wrote files in order.
               # We'll read URLs from files in order.
               # Better: we have already fetched URLs in order of i.
-              NEXT_URL="${WORKER_URLS##* }" ? Not reliable.
+              NEXT_URL="${WORKER_URLS##* }"
               # We'll fetch again in the loop.
               RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
                 -H "Accept: application/vnd.github+json" \
