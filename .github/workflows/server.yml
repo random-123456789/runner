@@ -68,7 +68,10 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           source .venv/bin/activate
+          # Force head to advertise only loopback
           export RAY_NODE_IP=127.0.0.1
+          export RAY_GCS_ADDRESS=127.0.0.1:6379
+          export RAY_ADDRESS=127.0.0.1:6379
           ray start --head --port=6379 \
             --node-ip-address=127.0.0.1 \
             --dashboard-host=127.0.0.1 \
@@ -187,11 +190,12 @@ jobs:
           holesail --connect "$HEAD_NODE_URL" --port 6379 &
           sleep 10
 
+          # Force worker to use only the tunnel (localhost)
           export RAY_NODE_IP=127.0.0.1
           export RAY_GCS_ADDRESS=127.0.0.1:6379
           export RAY_ADDRESS=127.0.0.1:6379
 
-          # Use --address to join the cluster, but override GCS with environment variables
+          # --address is required; point it to the tunnel endpoint
           ray start --address=127.0.0.1:6379 \
             --node-ip-address=127.0.0.1 \
             --disable-usage-stats
