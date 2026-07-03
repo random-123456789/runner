@@ -8,16 +8,13 @@ permissions:
   contents: write
 
 env:
-  WORKER_COUNT: 3                       # change to 19 for full cluster
-  MODEL_ID: "Qwen/Qwen2.5-7B-Instruct"  # can use any HF model
-  HEAD_REPO_FILE: "head_url.txt"        # file to share head's Holesail URL
+  WORKER_COUNT: 3
+  MODEL_ID: "Qwen/Qwen2.5-7B-Instruct"
+  HEAD_REPO_FILE: "head_url.txt"
 
 jobs:
-  # ============================================================
-  # HEAD NODE – Ray Head + vLLM API Server + Cloudflare Tunnel
-  # ============================================================
   head:
-    runs-on: macos-26                     # macOS ARM runner with Metal
+    runs-on: macos-26
     timeout-minutes: 360
 
     steps:
@@ -54,15 +51,23 @@ jobs:
       - name: Install system dependencies
         run: |
           brew install curl jq
+          # Install Python 3.13 (compatible with vLLM)
+          brew install python@3.13
           sudo npm install -g holesail
 
-      - name: Install Python and vLLM with Metal support
+      - name: Create virtual environment with Python 3.13
         run: |
-          python3 -m venv .venv
+          python3.13 -m venv .venv
           source .venv/bin/activate
           pip install --upgrade pip
-          # Install vLLM with Metal plugin (this includes Ray dependencies)
-          pip install vllm vllm-metal
+
+      - name: Install vLLM Metal and Ray
+        run: |
+          source .venv/bin/activate
+          # Install vllm-metal (includes MLX backend and Ray)
+          pip install vllm-metal
+          # Ray is a dependency of vllm-metal, but ensure it's installed
+          pip install ray[default]
 
       - name: Start Ray Head (bind to localhost) and expose via Holesail
         env:
@@ -70,7 +75,6 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           source .venv/bin/activate
-          # Force Ray to use loopback only (workers connect via Holesail tunnel)
           export RAY_NODE_IP=127.0.0.1
           export RAY_GCS_ADDRESS=127.0.0.1:6379
           export RAY_ADDRESS=127.0.0.1:6379
@@ -79,7 +83,6 @@ jobs:
             --dashboard-host=127.0.0.1 \
             --disable-usage-stats
 
-          # Expose Ray GCS via Holesail
           holesail --live 6379 > /tmp/holesail_head.txt 2>&1 &
           sleep 5
           HEAD_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_head.txt | head -1)
@@ -120,12 +123,12 @@ jobs:
             exit 1
           fi
 
-      - name: Start vLLM API Server (with Ray backend and Metal)
+      - name: Start vLLM API Server with Metal backend
         run: |
           source .venv/bin/activate
-          # Ensure Ray uses the tunnel
           export RAY_ADDRESS=127.0.0.1:6379
           export RAY_GCS_ADDRESS=127.0.0.1:6379
+          export VLLM_USE_MLX=1   # Force MLX backend
           python -m vllm.entrypoints.openai.api_server \
             --model $MODEL_ID \
             --tensor-parallel-size 1 \
@@ -170,28 +173,31 @@ jobs:
       - name: Keep alive
         run: sleep infinity
 
-  # ============================================================
-  # WORKER NODES – Connect to Ray Head, start Ray workers
-  # ============================================================
   worker:
     runs-on: macos-26
     strategy:
       matrix:
-        worker_id: [1, 2, 3]   # change to 19 for full cluster
+        worker_id: [1, 2, 3]
     timeout-minutes: 360
 
     steps:
       - name: Install system dependencies
         run: |
           brew install curl jq
+          brew install python@3.13
           sudo npm install -g holesail
 
-      - name: Install Python and vLLM with Metal
+      - name: Create virtual environment with Python 3.13
         run: |
-          python3 -m venv .venv
+          python3.13 -m venv .venv
           source .venv/bin/activate
           pip install --upgrade pip
-          pip install vllm vllm-metal
+
+      - name: Install vLLM Metal and Ray
+        run: |
+          source .venv/bin/activate
+          pip install vllm-metal
+          pip install ray[default]
 
       - name: Fetch Head Node URL from repository
         env:
@@ -231,18 +237,16 @@ jobs:
           WORKER_ID: ${{ matrix.worker_id }}
         run: |
           source .venv/bin/activate
-          # Connect to head's Ray GCS via Holesail
           holesail --connect "$HEAD_NODE_URL" --port 6379 &
           sleep 10
 
-          # Force Ray to use loopback (tunnel)
           export RAY_NODE_IP=127.0.0.1
           export RAY_GCS_ADDRESS=127.0.0.1:6379
           export RAY_ADDRESS=127.0.0.1:6379
 
-          ray start --address=0.0.0.0:6379 --disable-usage-stats
+          ray start --address=127.0.0.1:6379 --disable-usage-stats
 
-          # Register this worker as ready (optional)
+          # Register worker as ready
           mkdir -p workers
           echo "{\"status\": \"ready\", \"worker_id\": $WORKER_ID}" > workers/worker${WORKER_ID}.json
           ENCODED=$(base64 -w0 workers/worker${WORKER_ID}.json)
@@ -272,5 +276,4 @@ jobs:
             sleep 3
           done
 
-          # Keep alive
           sleep infinity
