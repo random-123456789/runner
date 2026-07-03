@@ -101,7 +101,7 @@ jobs:
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x cloudflared
           fi
-          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
+          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8265 > tunnel.log 2>&1 &
           echo "⏳ Waiting for Cloudflare tunnel to be ready..."
           TUNNEL_URL=""
           for i in {1..30}; do
