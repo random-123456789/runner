@@ -93,13 +93,11 @@ jobs:
           git clone https://github.com/OpenCPIL/prima.cpp.git
           cd prima.cpp
           make USE_HIGHS=1 -j$(nproc)
-          # Ensure llama-server is built
           if [ ! -f ./llama-server ]; then
-            echo "⚠️ llama-server missing, building it explicitly"
             make llama-server
           fi
           if [ -f ./llama-server ]; then
-            echo "✅ llama-server built successfully"
+            echo "✅ llama-server built"
           else
             echo "❌ llama-server not found!"
             ls -la
@@ -114,7 +112,7 @@ jobs:
           if [ "$(head -c 4 models/model.gguf)" = "GGUF" ]; then
             echo "✅ Valid GGUF file downloaded"
           else
-            echo "❌ Invalid GGUF file – showing first 20 bytes:"
+            echo "❌ Invalid GGUF file"
             head -c 20 models/model.gguf | xxd
             exit 1
           fi
@@ -243,39 +241,48 @@ jobs:
           holesail --connect "$WORKER1_URL" --port 7001 &
           sleep 5
 
-      - name: Start prima.cpp master (llama-server)
+      - name: Start prima.cpp master (llama-server) with proper logging
         run: |
           cd prima.cpp
           export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
           if [ ! -f ./llama-server ]; then
             echo "❌ llama-server binary not found!"
-            ls -la
             exit 1
           fi
           chmod +x ./llama-server
           WORLD=$((WORKER_COUNT + 1))
-          nohup ./llama-server \
+          # Use stdbuf to disable buffering, pipe to tee to capture both file and stdout
+          stdbuf -oL -eL ./llama-server \
             -m ../models/model.gguf \
             -c 2048 \
             --world $WORLD \
             --rank 0 \
-            --master 127.0.0.1:6000 \
+            --master 0.0.0.0:6000 \
             --next 127.0.0.1:7001 \
             --host 0.0.0.0 \
             --port 8080 \
-            > master.log 2>&1 &
+            2>&1 | tee master.log &
           SERVER_PID=$!
           echo "Server PID: $SERVER_PID"
-          sleep 3
+          sleep 2
+          # Force sync to ensure file is written
+          sync
           if ! ps -p $SERVER_PID > /dev/null; then
-            echo "❌ llama-server died immediately. Log:"
-            cat master.log
+            echo "❌ llama-server died. Log:"
+            cat master.log || echo "master.log not found"
             exit 1
           fi
           echo "✅ llama-server process is running (PID $SERVER_PID)"
+          echo "📄 Checking master.log existence:"
+          ls -la master.log || echo "master.log not found"
+          echo "📄 master.log (first 30 lines):"
+          head -30 master.log || echo "master.log not found"
+          echo "🔍 Listening ports:"
+          ss -lpn | grep -E "6000|8080" || echo "No ports found"
 
       - name: Wait for master to be truly ready (200 OK)
         run: |
+          cd prima.cpp
           echo "🌐 Waiting for master API to be ready..."
           READY=false
           for i in {1..150}; do
@@ -288,15 +295,17 @@ jobs:
             sleep 2
             if [ $i -eq 10 ]; then
               echo "📄 master.log (last 20 lines):"
-              tail -20 master.log || true
+              tail -20 master.log || echo "master.log not found"
               echo "Processes:"
               ps aux | grep llama-server || true
+              echo "Listening ports:"
+              ss -lpn | grep -E "6000|8080" || true
             fi
           done
           if [ "$READY" != "true" ]; then
             echo "❌ Master failed to become ready within 5 minutes"
             echo "📄 Full master.log:"
-            cat master.log
+            cat master.log || echo "master.log not found"
             exit 1
           fi
 
@@ -364,7 +373,7 @@ jobs:
           mkdir -p models
           curl -L -o models/model.gguf "$MODEL_URL" -f --retry 3
           if [ "$(head -c 4 models/model.gguf)" != "GGUF" ]; then
-            echo "❌ Invalid GGUF file on worker – aborting"
+            echo "❌ Invalid GGUF file on worker"
             exit 1
           fi
 
@@ -397,7 +406,7 @@ jobs:
           fi
           echo "MASTER_HOLESAIL_URL=$MASTER_URL" >> $GITHUB_ENV
 
-      - name: Connect to master via Holesail and test
+      - name: Connect to master via Holesail
         run: |
           holesail --connect "$MASTER_HOLESAIL_URL" --port 6000 &
           sleep 10
@@ -481,12 +490,11 @@ jobs:
           holesail --connect "$NEXT_HOLESAIL_URL" --port $NEXT_PORT &
           sleep 5
 
-      - name: Start prima.cpp worker (llama-cli) with delay
+      - name: Start prima.cpp worker (llama-cli) with wait
         env:
           WORKER_ID: ${{ matrix.worker_id }}
           WORKER_COUNT: ${{ env.WORKER_COUNT }}
         run: |
-          # Wait for the master to be ready (sleep 60 seconds to allow master to start)
           echo "⏳ Waiting 60 seconds for master to be ready..."
           sleep 60
 
@@ -510,10 +518,9 @@ jobs:
             --prefetch \
             > worker.log 2>&1 &
 
-          # Print worker log after a short delay
           sleep 10
-          echo "📄 worker.log (first 20 lines):"
-          head -20 worker.log || true
+          echo "📄 worker.log (first 30 lines):"
+          head -30 worker.log || echo "worker.log not found"
 
       - name: Keep alive
         run: sleep infinity
