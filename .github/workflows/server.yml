@@ -264,7 +264,7 @@ jobs:
           set -e
           echo "🐝 Worker $INSTANCE_ID starting..."
           PORT=50052
-          ./rpc-server -H 0.0.0.0 -p ${PORT} -c &
+          ./rpc-server -H 0.0.0.0 -p ${PORT} -c -t 4&
           sleep 5
           echo "Starting Holesail server on port ${PORT}..."
           holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
