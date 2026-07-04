@@ -1,4 +1,4 @@
-name: P2P Inference Mesh (Holesail)
+name: Distributed-Llama (b4rtaz)
 
 on:
   workflow_dispatch:
@@ -8,6 +8,9 @@ permissions:
   contents: write
 
 jobs:
+  # ============================================
+  # QUEEN – coordinates workers and serves API
+  # ============================================
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -31,6 +34,7 @@ jobs:
             fi
           done
           echo "✅ Cleanup done."
+
       - name: Create workers directory
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -54,30 +58,19 @@ jobs:
               -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
           fi
           echo "✅ workers directory ready."
-      - name: Install dependencies
+
+      - name: Install dependencies (Queen)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake nodejs npm openssl
-      - name: Install Holesail (global)
-        run: sudo npm install -g holesail
+          sudo apt-get install -y jq curl python3 python3-pip nodejs npm openssl
+          sudo npm install -g holesail
 
-      - name: Build llama-server with RPC support
+      - name: Clone and install distributed-llama
         run: |
-          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/tags/b8487.zip
-          unzip -q llama.cpp.zip
-          cd llama.cpp-b8487
-          mkdir build && cd build
-          cmake .. -DGGML_NATIVE=ON -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
-          cmake --build . --config Release -j4 --target llama-server
-          cp bin/llama-server ../../
-          cd ../..
-          chmod +x llama-server
-          if ./llama-server --help 2>&1 | grep -q rpc; then
-            echo "✅ llama-server RPC support enabled"
-          else
-            echo "❌ llama-server RPC support missing"
-            exit 1
-          fi
+          git clone https://github.com/b4rtaz/distributed-llama.git
+          cd distributed-llama
+          pip3 install .
+
       - name: Download model
         run: |
           MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
@@ -88,6 +81,7 @@ jobs:
             echo "❌ Invalid GGUF file"
             exit 1
           fi
+
       - name: Wait for workers and collect Holesail URLs
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
@@ -135,7 +129,7 @@ jobs:
             exit 1
           fi
           echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
-      # ---------- FIX: Use `--port` to bind each client to a unique local port ----------
+
       - name: Connect to workers via Holesail (unique ports)
         env:
           HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
@@ -143,48 +137,52 @@ jobs:
           echo "🔗 Connecting to workers via Holesail P2P tunnels..."
           IFS=',' read -ra URLS <<< "${HOLESAIL_URLS}"
           LOCAL_PORT=60000
-          RPC_ADDRS=""
+          WORKER_ADDRS=""
           for url in "${URLS[@]}"; do
             echo "Connecting worker ${url} → localhost:${LOCAL_PORT}"
-            # Use --port to force client to listen on a specific local port
             holesail "${url}" --port ${LOCAL_PORT} &
-            if [ -n "$RPC_ADDRS" ]; then
-              RPC_ADDRS="${RPC_ADDRS},127.0.0.1:${LOCAL_PORT}"
+            if [ -n "$WORKER_ADDRS" ]; then
+              WORKER_ADDRS="${WORKER_ADDRS},127.0.0.1:${LOCAL_PORT}"
             else
-              RPC_ADDRS="127.0.0.1:${LOCAL_PORT}"
+              WORKER_ADDRS="127.0.0.1:${LOCAL_PORT}"
             fi
             LOCAL_PORT=$((LOCAL_PORT + 1))
           done
-          echo "RPC_ADDRS=${RPC_ADDRS}" >> $GITHUB_ENV
-          echo "✅ All Holesail clients started. RPC: ${RPC_ADDRS}"
+          echo "WORKER_ADDRS=${WORKER_ADDRS}" >> $GITHUB_ENV
+          echo "✅ All Holesail clients started. Worker addresses: ${WORKER_ADDRS}"
           sleep 10   # give tunnels time to establish
-      - name: Start llama-server with RPC and Cloudflare tunnel
+
+      - name: Start distributed-llama root node and Cloudflare tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
-          RPC_ADDRS: ${{ env.RPC_ADDRS }}
+          WORKER_ADDRS: ${{ env.WORKER_ADDRS }}
         run: |
-          echo "🌐 Starting llama-server with RPC workers: ${RPC_ADDRS}"
-          ./llama-server \
-            -m model.gguf \
-            --rpc ${RPC_ADDRS} \
-            -fa on \
-            -c 4096 \
+          echo "🌐 Starting distributed-llama root node with workers: ${WORKER_ADDRS}"
+          # The root node binds to 0.0.0.0:8080 by default (can be changed)
+          cd distributed-llama
+          python3 -m dllama.root \
+            --workers "${WORKER_ADDRS}" \
+            --model ../model.gguf \
+            --threads 2 \
+            --root_ip 0.0.0.0 \
+            --root_port 8080 \
             &
-          
-          for i in {1..600}; do
+          cd ..
+
+          for i in {1..60}; do
             if curl -s http://localhost:8080/health > /dev/null; then
-              echo "✅ llama-server is ready"
+              echo "✅ distributed-llama root is ready"
               break
             fi
-            echo "⏳ Waiting for llama-server... ($i/600)"
+            echo "⏳ Waiting for root node... ($i/60)"
             sleep 2
           done
           if ! curl -s http://localhost:8080/health > /dev/null; then
-            echo "❌ llama-server failed to start"
-            cat server.log
+            echo "❌ Root node failed to start"
             exit 1
           fi
+
           echo "🌐 Starting Cloudflare tunnel..."
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -205,6 +203,7 @@ jobs:
             tail -50 tunnel.log
             exit 1
           fi
+
           CHAT_REPO="${{ github.repository_owner }}/chat"
           NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
           ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
@@ -223,6 +222,10 @@ jobs:
           echo "::notice::Frontend URL: https://$CHAT_REPO"
           echo "🔄 Queen is serving. Keeping alive..."
           sleep infinity
+
+  # ============================================
+  # WORKER – each runs a slice of the model
+  # ============================================
   worker:
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -231,25 +234,19 @@ jobs:
         instance: [1, 2, 3, 4, 5]
 
     steps:
-      - name: Install dependencies
+      - name: Install dependencies (Worker)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl build-essential cmake nodejs npm openssl
-      - name: Install Holesail (global)
-        run: sudo npm install -g holesail
+          sudo apt-get install -y jq curl python3 python3-pip nodejs npm openssl
+          sudo npm install -g holesail
 
-      - name: Build rpc-server
+      - name: Clone and install distributed-llama
         run: |
-          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/tags/b8487.zip
-          unzip -q llama.cpp.zip
-          cd llama.cpp-b8487
-          mkdir build && cd build
-          cmake .. -DGGML_NATIVE=ON -DGGML_RPC=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
-          cmake --build . --config Release -j4 --target rpc-server
-          cp bin/rpc-server ../../
-          cd ../..
-          chmod +x rpc-server
-      - name: Start RPC server and create Holesail tunnel
+          git clone https://github.com/b4rtaz/distributed-llama.git
+          cd distributed-llama
+          pip3 install .
+
+      - name: Start distributed-llama worker and Holesail tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO: ${{ github.repository }}
@@ -258,8 +255,12 @@ jobs:
           set -e
           echo "🐝 Worker $INSTANCE_ID starting..."
           PORT=50052
-          ./rpc-server -H 0.0.0.0 -p ${PORT} -t 4 -c &
+          cd distributed-llama
+          # Worker binds to 0.0.0.0 so Holesail can forward
+          python3 -m dllama.worker --ip 0.0.0.0 --port ${PORT} &
+          cd ..
           sleep 5
+
           echo "Starting Holesail server on port ${PORT}..."
           holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
           sleep 5
@@ -270,10 +271,12 @@ jobs:
             exit 1
           fi
           echo "✅ Worker $INSTANCE_ID connection string: ${CONNECTION_STRING}"
+
           WORKER_FILE="workers/hole${INSTANCE_ID}.json"
           mkdir -p workers
           echo "{\"url\": \"${CONNECTION_STRING}\"}" > ${WORKER_FILE}
           ENCODED=$(base64 -w0 ${WORKER_FILE})
+
           for attempt in {1..10}; do
             echo "📝 Registration attempt $attempt for worker $INSTANCE_ID"
             FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
@@ -310,10 +313,14 @@ jobs:
             echo "Response: $RESPONSE"
             exit 1
           done
+
+          # Keep worker alive – restart processes if they die
           while true; do
-            if ! pgrep -f "rpc-server" > /dev/null; then
-              echo "⚠️ RPC server died, restarting..."
-              ./rpc-server -H 0.0.0.0 -p ${PORT} -c &
+            if ! pgrep -f "dllama.worker" > /dev/null; then
+              echo "⚠️ Worker process died, restarting..."
+              cd distributed-llama
+              python3 -m dllama.worker --ip 0.0.0.0 --port ${PORT} &
+              cd ..
             fi
             if ! pgrep -f "holesail" > /dev/null; then
               echo "⚠️ Holesail server died, restarting..."
