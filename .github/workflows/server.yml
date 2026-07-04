@@ -1,4 +1,4 @@
-name: Distributed-Llama (Single-Node Fallback)
+name: Distributed-Llama (with 1 Worker – 2 Nodes)
 
 on:
   workflow_dispatch:
@@ -75,13 +75,71 @@ jobs:
           python3 distributed-llama/launch.py llama3_2_1b_instruct_q40 -y -skip-run -skip-script
           ls -la distributed-llama/models/llama3_2_1b_instruct_q40/
 
-      # No worker registration needed – we run in single‑node mode
-      - name: Start API server (single-node) and Cloudflare tunnel
+      # ---- Wait for exactly 1 worker ----
+      - name: Wait for 1 worker and collect Holesail URL
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "👑 Queen waiting for exactly 1 worker..."
+          for attempt in {1..120}; do
+            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
+            if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
+              WORKER_COUNT=0
+            else
+              WORKER_FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
+              WORKER_COUNT=$(echo "$WORKER_FILES" | grep -c . || echo 0)
+            fi
+            echo "  Attempt $attempt: $WORKER_COUNT workers registered"
+            if [ "$WORKER_COUNT" -ge 1 ]; then
+              echo "✅ Worker registered!"
+              break
+            fi
+            sleep 5
+          done
+          if [ "$WORKER_COUNT" -lt 1 ]; then
+            echo "❌ Timeout waiting for worker"
+            exit 1
+          fi
+          HOLESAIL_URLS=""
+          for file in $WORKER_FILES; do
+            if [ "$file" = ".keep" ]; then continue; fi
+            curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${REPO}/contents/workers/${file}" \
+              > /tmp/worker.json
+            URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url')
+            if [ -n "$URL" ] && [ "$URL" != "null" ]; then
+              echo "Found URL: $URL"
+              HOLESAIL_URLS="$URL"
+              break
+            fi
+          done
+          if [ -z "$HOLESAIL_URLS" ]; then
+            echo "❌ No valid Holesail URL found"
+            exit 1
+          fi
+          echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
+
+      - name: Connect to worker via Holesail
+        env:
+          HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
+        run: |
+          echo "🔗 Connecting to worker via Holesail P2P tunnel..."
+          holesail "${HOLESAIL_URLS}" --port 60000 &
+          WORKER_ADDRS="127.0.0.1:60000"
+          echo "WORKER_ADDRS=${WORKER_ADDRS}" >> $GITHUB_ENV
+          echo "✅ Holesail client started. Worker address: ${WORKER_ADDRS}"
+          sleep 20
+
+      - name: Start distributed-llama API server with worker and Cloudflare tunnel
         env:
           GH_TOKEN: ${{ secrets.TOKEN }}
           REPO_OWNER: ${{ github.repository_owner }}
+          WORKER_ADDRS: ${{ env.WORKER_ADDRS }}
         run: |
-          echo "🌐 Starting distributed-llama API server in single-node mode..."
+          echo "🌐 Starting distributed-llama API server with worker: ${WORKER_ADDRS}"
           cd distributed-llama
           MODEL_FILE=$(find models -name "dllama_model_*.m" | head -1)
           TOKENIZER_FILE=$(find models -name "dllama_tokenizer_*.t" | head -1)
@@ -91,14 +149,14 @@ jobs:
           fi
           echo "Using model: $MODEL_FILE"
           echo "Using tokenizer: $TOKENIZER_FILE"
-          # Omit --workers to run locally
           ./dllama-api \
             --port 8080 \
             --model "$MODEL_FILE" \
             --tokenizer "$TOKENIZER_FILE" \
             --buffer-float-type q80 \
-            --nthreads 4 \
+            --nthreads 2 \
             --max-seq-len 4096 \
+            --workers ${WORKER_ADDRS} \
             &
           cd ..
 
@@ -155,3 +213,106 @@ jobs:
           echo "::notice::Frontend URL: https://$CHAT_REPO"
           echo "🔄 Queen is serving. Keeping alive..."
           sleep infinity
+
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      matrix:
+        instance: [1]   # only one worker
+
+    steps:
+      - name: Install dependencies (Worker)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y jq curl python3 python3-pip nodejs npm openssl git build-essential
+          sudo npm install -g holesail
+
+      - name: Clone and build distributed-llama
+        run: |
+          git clone https://github.com/b4rtaz/distributed-llama.git
+          cd distributed-llama
+          make dllama
+          ls -la
+
+      - name: Start distributed-llama worker and Holesail tunnel
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
+          INSTANCE_ID: ${{ matrix.instance }}
+        run: |
+          set -e
+          echo "🐝 Worker $INSTANCE_ID starting..."
+          PORT=50052
+          cd distributed-llama
+          ./dllama worker --port ${PORT} --nthreads 2 &
+          cd ..
+          sleep 10
+
+          echo "Starting Holesail server on port ${PORT}..."
+          holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
+          sleep 10
+
+          CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
+          if [ -z "$CONNECTION_STRING" ]; then
+            echo "❌ Failed to get connection string from Holesail"
+            cat /tmp/holesail_output.txt
+            exit 1
+          fi
+          echo "✅ Worker $INSTANCE_ID connection string: ${CONNECTION_STRING}"
+
+          WORKER_FILE="workers/hole${INSTANCE_ID}.json"
+          mkdir -p workers
+          echo "{\"url\": \"${CONNECTION_STRING}\"}" > ${WORKER_FILE}
+          ENCODED=$(base64 -w0 ${WORKER_FILE})
+
+          for attempt in {1..15}; do
+            echo "📝 Registration attempt $attempt for worker $INSTANCE_ID"
+            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
+            SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
+            if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
+              PAYLOAD=$(jq -n \
+                --arg msg "register worker $INSTANCE_ID" \
+                --arg content "$ENCODED" \
+                --arg sha "$SHA" \
+                '{message: $msg, content: $content, sha: $sha}')
+            else
+              PAYLOAD=$(jq -n \
+                --arg msg "register worker $INSTANCE_ID" \
+                --arg content "$ENCODED" \
+                '{message: $msg, content: $content}')
+            fi
+            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
+              -d "$PAYLOAD")
+            if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
+              echo "✅ Worker $INSTANCE_ID registered successfully!"
+              break
+            fi
+            STATUS=$(echo "$RESPONSE" | jq -r '.status' 2>/dev/null)
+            if [ "$STATUS" = "409" ]; then
+              echo "⚠️ Conflict detected – retrying in 3 seconds..."
+              sleep 3
+              continue
+            fi
+            echo "❌ Failed to register worker $INSTANCE_ID"
+            echo "Response: $RESPONSE"
+            exit 1
+          done
+
+          while true; do
+            if ! pgrep -f "dllama worker" > /dev/null; then
+              echo "⚠️ Worker process died, restarting..."
+              cd distributed-llama
+              ./dllama worker --port ${PORT} --nthreads 2 &
+              cd ..
+            fi
+            if ! pgrep -f "holesail" > /dev/null; then
+              echo "⚠️ Holesail server died, restarting..."
+              holesail --live ${PORT} &
+            fi
+            sleep 30
+          done
