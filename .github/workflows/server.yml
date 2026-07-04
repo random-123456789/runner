@@ -71,17 +71,14 @@ jobs:
           cd distributed-llama
           make dllama
           make dllama-api
-          ls -la  # show binaries
+          ls -la
 
-      - name: Download model using distributed-llama launcher
+      - name: Download model (llama3.2 1B Instruct Q40)
         run: |
           cd distributed-llama
-          # List available models (optional)
-          python3 launch.py
-          # Download a small Q40 model (adjust if needed)
-          python3 launch.py llama3_2_3b_instruct_q40
-          # The model files will be in ./models/llama3_2_3b_instruct_q40/
-          ls -la models/
+          python3 download-model.py llama3_2_1b_instruct_q40
+          # verify model files exist
+          ls -la models/llama3_2_1b_instruct_q40/
 
       - name: Wait for workers and collect Holesail URLs
         env:
@@ -151,7 +148,7 @@ jobs:
           done
           echo "WORKER_ADDRS=${WORKER_ADDRS}" >> $GITHUB_ENV
           echo "✅ All Holesail clients started. Worker addresses: ${WORKER_ADDRS}"
-          sleep 10   # give tunnels time to establish
+          sleep 10
 
       - name: Start distributed-llama API server and Cloudflare tunnel
         env:
@@ -161,8 +158,7 @@ jobs:
         run: |
           echo "🌐 Starting distributed-llama API server with workers: ${WORKER_ADDRS}"
           cd distributed-llama
-          # Build the worker address list as space-separated
-          # The model path: models/llama3_2_3b_instruct_q40/dllama_model_*.m
+          # Locate model and tokenizer files
           MODEL_FILE=$(find models -name "dllama_model_*.m" | head -1)
           TOKENIZER_FILE=$(find models -name "dllama_tokenizer_*.t" | head -1)
           if [ -z "$MODEL_FILE" ] || [ -z "$TOKENIZER_FILE" ]; then
@@ -171,7 +167,7 @@ jobs:
           fi
           echo "Using model: $MODEL_FILE"
           echo "Using tokenizer: $TOKENIZER_FILE"
-          # Start API server on port 8080, bind to 0.0.0.0
+          # Start API server on port 8080
           ./dllama-api \
             --port 8080 \
             --model "$MODEL_FILE" \
@@ -271,7 +267,6 @@ jobs:
           echo "🐝 Worker $INSTANCE_ID starting..."
           PORT=50052
           cd distributed-llama
-          # Worker binds to 0.0.0.0 so Holesail can forward
           ./dllama worker --port ${PORT} --nthreads 2 &
           cd ..
           sleep 5
@@ -329,7 +324,7 @@ jobs:
             exit 1
           done
 
-          # Keep worker alive – restart processes if they die
+          # Keep worker alive
           while true; do
             if ! pgrep -f "dllama worker" > /dev/null; then
               echo "⚠️ Worker process died, restarting..."
