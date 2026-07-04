@@ -496,7 +496,7 @@ jobs:
           WORKER_COUNT: ${{ env.WORKER_COUNT }}
         run: |
           echo "⏳ Waiting 60 seconds for master to be ready..."
-          sleep 60
+          sleep 90
 
           cd prima.cpp
           export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
