@@ -1,11 +1,10 @@
-# .github/workflows/skill-watcher.yml
 name: Skill Watcher
 
 on:
   push:
     paths:
       - 'skills/*.yaml'
-  workflow_dispatch:   # manual trigger for testing
+  workflow_dispatch:
 
 permissions:
   contents: read
