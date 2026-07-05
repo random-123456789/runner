@@ -8,3 +8,4 @@ parameters:
   required: ["url"]
 mcp_server: "npx @modelcontextprotocol/server-fetch"
 port: 50053
+
