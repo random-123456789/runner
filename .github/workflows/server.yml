@@ -35,25 +35,10 @@ jobs:
           cp bin/llama-server ../../
           cd ../..
           chmod +x llama-server
-          # Show help (debug) – optional
-          ./llama-server --help | head -30
 
       - name: Download model
         run: |
           curl -L -o model.gguf "https://huggingface.co/${{ env.QUEEN_MODEL }}" -f --retry 3
-
-      - name: Generate system prompt from skills
-        run: |
-          BASE_PROMPT=$(cat prompts/default.md)
-          SKILLS_LIST=""
-          for skill in skills/*.yaml; do
-            if [ -f "$skill" ]; then
-              NAME=$(grep '^name:' "$skill" | head -1 | sed 's/name: //' | xargs)
-              DESC=$(grep '^description:' "$skill" | head -1 | sed 's/description: //' | xargs)
-              SKILLS_LIST="${SKILLS_LIST}\n- **$NAME**: $DESC"
-            fi
-          done
-          echo "${BASE_PROMPT//\{\{skills_list\}\}/$SKILLS_LIST}" > system_prompt.txt
 
       - name: Start MCP proxy (from repo)
         run: |
@@ -67,7 +52,7 @@ jobs:
           echo "Waiting for workers to register..."
           sleep 30
 
-      - name: Start llama-server with proxy (no --api)
+      - name: Start llama-server with proxy (no --system-prompt)
         env:
           MCP_ENDPOINTS: "http://localhost:${{ env.PROXY_PORT }}/mcp"
         run: |
@@ -78,7 +63,6 @@ jobs:
             -ngl 0 \
             --host 0.0.0.0 \
             --port 8080 \
-            --system-prompt "$(cat system_prompt.txt)" \
             --mcp "$MCP_ENDPOINTS" \
             &
 
