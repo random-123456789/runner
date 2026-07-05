@@ -1,177 +1,99 @@
-name: Distributed-Llama (with 1 Worker – 2 Nodes)
+name: Queen Orchestrator
 
 on:
   workflow_dispatch:
 
 permissions:
-  actions: write
   contents: write
+  actions: write
+
+env:
+  QUEEN_MODEL: "bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+  PROXY_PORT: 8081
 
 jobs:
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
     steps:
-      - name: Clean workers directory
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          echo "🧹 Cleaning workers directory..."
-          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
-          echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name + ":" + .sha' 2>/dev/null | while IFS=':' read -r name sha; do
-            if [ -n "$name" ] && [ -n "$sha" ]; then
-              curl -s -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${REPO}/contents/workers/${name}" \
-                -d "{\"message\":\"cleanup\",\"sha\":\"${sha}\"}" || true
-            fi
-          done
-          echo "✅ Cleanup done."
+      - uses: actions/checkout@v4
 
-      - name: Create workers directory
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-        run: |
-          echo "📁 Creating fresh workers directory..."
-          RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/workers/.keep" 2>/dev/null)
-          SHA=$(echo "$RESPONSE" | jq -r '.sha' 2>/dev/null)
-          echo "" | base64 -w0 > empty_keep
-          if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
-              -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\",\"sha\":\"${SHA}\"}" || true
-          else
-            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers/.keep" \
-              -d "{\"message\":\"create workers directory\",\"content\":\"$(cat empty_keep)\"}" || true
-          fi
-          echo "✅ workers directory ready."
-
-      - name: Install dependencies (Queen)
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y jq curl python3 python3-pip nodejs npm openssl git build-essential
+          sudo apt-get install -y jq curl git build-essential cmake python3 python3-pip nodejs npm
           sudo npm install -g holesail
+          pip3 install fastapi uvicorn httpx pyyaml
 
-      - name: Clone and build distributed-llama
+      - name: Build llama.cpp with MCP
         run: |
-          git clone https://github.com/b4rtaz/distributed-llama.git
-          cd distributed-llama
-          make dllama
-          make dllama-api
-          ls -la
+          git clone https://github.com/ggerganov/llama.cpp.git
+          cd llama.cpp
+          mkdir build && cd build
+          cmake .. -DLLAMA_MCP=ON -DLLAMA_CUBLAS=OFF
+          cmake --build . --config Release -j $(nproc)
+          cp bin/llama-server ../../
+          cd ../..
+          chmod +x llama-server
 
-      - name: Download model (llama3.2 1B Instruct Q40)
+      - name: Download model
         run: |
-          python3 distributed-llama/launch.py llama3_2_1b_instruct_q40 -y -skip-run -skip-script
-          ls -la distributed-llama/models/llama3_2_1b_instruct_q40/
+          curl -L -o model.gguf "https://huggingface.co/${{ env.QUEEN_MODEL }}" -f --retry 3
 
-      # ============================================================
-      # 🔧 FIXED: Wait for worker and extract valid Holesail URL
-      # ============================================================
-      - name: Wait for 1 worker and collect Holesail URL
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
+      - name: Generate system prompt from skills
         run: |
-          echo "👑 Queen waiting for worker with valid URL..."
-          HOLESAIL_URLS=""
-          for attempt in {1..120}; do
-            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
-            if [ "$(echo "$RESPONSE" | jq -r '.message' 2>/dev/null)" = "Not Found" ]; then
-              WORKER_COUNT=0
-              WORKER_FILES=""
-            else
-              WORKER_FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file") | .name' 2>/dev/null)
-              WORKER_COUNT=$(echo "$WORKER_FILES" | grep -c . || echo 0)
+          BASE_PROMPT=$(cat prompts/default.md)
+          SKILLS_LIST=""
+          for skill in skills/*.yaml; do
+            if [ -f "$skill" ]; then
+              NAME=$(grep '^name:' "$skill" | head -1 | sed 's/name: //' | xargs)
+              DESC=$(grep '^description:' "$skill" | head -1 | sed 's/description: //' | xargs)
+              SKILLS_LIST="${SKILLS_LIST}\n- **$NAME**: $DESC"
             fi
-            echo "  Attempt $attempt: $WORKER_COUNT workers registered"
-            # Try to extract a URL from any worker file
-            for file in $WORKER_FILES; do
-              if [ "$file" = ".keep" ]; then continue; fi
-              curl -s -H "Authorization: Bearer $GH_TOKEN" \
-                "https://api.github.com/repos/${REPO}/contents/workers/${file}" \
-                > /tmp/worker.json
-              URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url' 2>/dev/null)
-              if [ -n "$URL" ] && [ "$URL" != "null" ]; then
-                echo "✅ Found valid URL in $file: $URL"
-                HOLESAIL_URLS="$URL"
-                break 2
-              else
-                echo "⚠️ No valid URL in $file yet"
-              fi
-            done
-            sleep 5
           done
-          if [ -z "$HOLESAIL_URLS" ]; then
-            echo "❌ No valid Holesail URL found after 120 attempts"
-            exit 1
-          fi
-          echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
+          echo "${BASE_PROMPT//\{\{skills_list\}\}/$SKILLS_LIST}" > system_prompt.txt
 
-      - name: Connect to worker via Holesail
-        env:
-          HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
+      - name: Start MCP proxy (from repo)
         run: |
-          echo "🔗 Connecting to worker via Holesail P2P tunnel..."
-          holesail "${HOLESAIL_URLS}" --port 60000 &
-          WORKER_ADDRS="127.0.0.1:60000"
-          echo "WORKER_ADDRS=${WORKER_ADDRS}" >> $GITHUB_ENV
-          echo "✅ Holesail client started. Worker address: ${WORKER_ADDRS}"
-          sleep 20
+          chmod +x mcp_proxy.py
+          python3 mcp_proxy.py &
+          sleep 10
+          echo "✅ MCP proxy started on port ${{ env.PROXY_PORT }}"
 
-      - name: Start distributed-llama API server with worker and Cloudflare tunnel
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO_OWNER: ${{ github.repository_owner }}
-          WORKER_ADDRS: ${{ env.WORKER_ADDRS }}
+      - name: Wait for initial workers to register
         run: |
-          echo "🌐 Starting distributed-llama API server with worker: ${WORKER_ADDRS}"
-          cd distributed-llama
-          MODEL_FILE=$(find models -name "dllama_model_*.m" | head -1)
-          TOKENIZER_FILE=$(find models -name "dllama_tokenizer_*.t" | head -1)
-          if [ -z "$MODEL_FILE" ] || [ -z "$TOKENIZER_FILE" ]; then
-            echo "❌ Model or tokenizer not found"
-            exit 1
-          fi
-          echo "Using model: $MODEL_FILE"
-          echo "Using tokenizer: $TOKENIZER_FILE"
-          ./dllama-api \
+          echo "Waiting for workers to register..."
+          sleep 30
+
+      - name: Start llama-server with proxy
+        env:
+          MCP_ENDPOINTS: "http://localhost:${{ env.PROXY_PORT }}/mcp"
+        run: |
+          echo "🌐 Starting llama-server with MCP proxy: $MCP_ENDPOINTS"
+          ./llama-server \
+            -m model.gguf \
+            -c 4096 \
+            -ngl 0 \
+            --host 0.0.0.0 \
             --port 8080 \
-            --model "$MODEL_FILE" \
-            --tokenizer "$TOKENIZER_FILE" \
-            --buffer-float-type q80 \
-            --nthreads 2 \
-            --max-seq-len 4096 \
-            --workers ${WORKER_ADDRS} \
+            --api \
+            --system-prompt "$(cat system_prompt.txt)" \
+            --mcp "$MCP_ENDPOINTS" \
             &
-          cd ..
 
           for i in {1..60}; do
             if curl -s http://localhost:8080/health > /dev/null; then
-              echo "✅ API server is ready"
+              echo "✅ Server ready"
               break
             fi
-            echo "⏳ Waiting for API server... ($i/60)"
             sleep 2
           done
           if ! curl -s http://localhost:8080/health > /dev/null; then
-            echo "❌ API server failed to start"
+            echo "❌ Server failed"
             exit 1
           fi
 
-          echo "🌐 Starting Cloudflare tunnel..."
+          # Cloudflare tunnel
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x cloudflared
@@ -183,134 +105,7 @@ jobs:
               echo "✅ Tunnel URL: $TUNNEL_URL"
               break
             fi
-            echo "⏳ Waiting for tunnel... ($i/30)"
             sleep 3
           done
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ Failed to get tunnel URL"
-            tail -50 tunnel.log
-            exit 1
-          fi
-
-          # Optional: update a chat frontend repo
-          CHAT_REPO="${{ github.repository_owner }}/chat"
-          NEW_CONFIG=$(jq -n --arg url "$TUNNEL_URL" '{apiUrl: $url}')
-          ENCODED=$(echo "$NEW_CONFIG" | base64 -w0)
-          FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${CHAT_REPO}/contents/config.json")
-          SHA=$(echo "$FILE_INFO" | jq -r '.sha')
-          if [ "$SHA" != "null" ]; then
-            PAYLOAD=$(jq -n --arg msg "update API URL" --arg content "$ENCODED" --arg sha "$SHA" \
-              '{message: $msg, content: $content, sha: $sha}')
-            curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${CHAT_REPO}/contents/config.json" \
-              -d "$PAYLOAD"
-          fi
-          echo "::notice::Frontend URL: https://$CHAT_REPO"
-          echo "🔄 Queen is serving. Keeping alive..."
+          echo "::notice::Frontend URL: $TUNNEL_URL"
           sleep infinity
-
-  worker:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    strategy:
-      matrix:
-        instance: [1]   # only one worker → total nodes = 2 (power of two)
-
-    steps:
-      - name: Install dependencies (Worker)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y jq curl python3 python3-pip nodejs npm openssl git build-essential
-          sudo npm install -g holesail
-
-      - name: Clone and build distributed-llama
-        run: |
-          git clone https://github.com/b4rtaz/distributed-llama.git
-          cd distributed-llama
-          make dllama
-          ls -la
-
-      - name: Start distributed-llama worker and Holesail tunnel
-        env:
-          GH_TOKEN: ${{ secrets.TOKEN }}
-          REPO: ${{ github.repository }}
-          INSTANCE_ID: ${{ matrix.instance }}
-        run: |
-          set -e
-          echo "🐝 Worker $INSTANCE_ID starting..."
-          PORT=50052
-          cd distributed-llama
-          ./dllama worker --port ${PORT} --nthreads 2 &
-          cd ..
-          sleep 10
-
-          echo "Starting Holesail server on port ${PORT}..."
-          holesail --live ${PORT} > /tmp/holesail_output.txt 2>&1 &
-          sleep 10
-
-          CONNECTION_STRING=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_output.txt | head -1)
-          if [ -z "$CONNECTION_STRING" ]; then
-            echo "❌ Failed to get connection string from Holesail"
-            cat /tmp/holesail_output.txt
-            exit 1
-          fi
-          echo "✅ Worker $INSTANCE_ID connection string: ${CONNECTION_STRING}"
-
-          WORKER_FILE="workers/hole${INSTANCE_ID}.json"
-          mkdir -p workers
-          echo "{\"url\": \"${CONNECTION_STRING}\"}" > ${WORKER_FILE}
-          ENCODED=$(base64 -w0 ${WORKER_FILE})
-
-          for attempt in {1..15}; do
-            echo "📝 Registration attempt $attempt for worker $INSTANCE_ID"
-            FILE_INFO=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}")
-            SHA=$(echo "$FILE_INFO" | jq -r '.sha' 2>/dev/null)
-            if [ "$SHA" != "null" ] && [ -n "$SHA" ]; then
-              PAYLOAD=$(jq -n \
-                --arg msg "register worker $INSTANCE_ID" \
-                --arg content "$ENCODED" \
-                --arg sha "$SHA" \
-                '{message: $msg, content: $content, sha: $sha}')
-            else
-              PAYLOAD=$(jq -n \
-                --arg msg "register worker $INSTANCE_ID" \
-                --arg content "$ENCODED" \
-                '{message: $msg, content: $content}')
-            fi
-            RESPONSE=$(curl -s -X PUT -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
-              -d "$PAYLOAD")
-            if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
-              echo "✅ Worker $INSTANCE_ID registered successfully!"
-              break
-            fi
-            STATUS=$(echo "$RESPONSE" | jq -r '.status' 2>/dev/null)
-            if [ "$STATUS" = "409" ]; then
-              echo "⚠️ Conflict detected – retrying in 3 seconds..."
-              sleep 3
-              continue
-            fi
-            echo "❌ Failed to register worker $INSTANCE_ID"
-            echo "Response: $RESPONSE"
-            exit 1
-          done
-
-          while true; do
-            if ! pgrep -f "dllama worker" > /dev/null; then
-              echo "⚠️ Worker process died, restarting..."
-              cd distributed-llama
-              ./dllama worker --port ${PORT} --nthreads 2 &
-              cd ..
-            fi
-            if ! pgrep -f "holesail" > /dev/null; then
-              echo "⚠️ Holesail server died, restarting..."
-              holesail --live ${PORT} &
-            fi
-            sleep 30
-          done
