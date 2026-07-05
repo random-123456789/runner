@@ -25,16 +25,18 @@ jobs:
           sudo npm install -g holesail
           pip3 install fastapi uvicorn httpx pyyaml
 
-      - name: Build llama.cpp with MCP
+      - name: Build llama.cpp with MCP support
         run: |
           git clone https://github.com/ggerganov/llama.cpp.git
           cd llama.cpp
           mkdir build && cd build
-          cmake .. -DLLAMA_MCP=ON -DLLAMA_CUBLAS=OFF
-          cmake --build . --config Release -j $(nproc)
+          cmake .. -DGGML_NATIVE=ON -DLLAMA_MCP=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
+          cmake --build . --config Release -j4 --target llama-server
           cp bin/llama-server ../../
           cd ../..
           chmod +x llama-server
+          # Show help (debug) – optional
+          ./llama-server --help | head -30
 
       - name: Download model
         run: |
@@ -65,7 +67,7 @@ jobs:
           echo "Waiting for workers to register..."
           sleep 30
 
-      - name: Start llama-server with proxy
+      - name: Start llama-server with proxy (no --api)
         env:
           MCP_ENDPOINTS: "http://localhost:${{ env.PROXY_PORT }}/mcp"
         run: |
@@ -76,7 +78,6 @@ jobs:
             -ngl 0 \
             --host 0.0.0.0 \
             --port 8080 \
-            --api \
             --system-prompt "$(cat system_prompt.txt)" \
             --mcp "$MCP_ENDPOINTS" \
             &
