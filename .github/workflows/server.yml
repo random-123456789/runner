@@ -9,7 +9,8 @@ permissions:
 
 env:
   QUEEN_MODEL: "bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
-  PROXY_PORT: 8081
+  PROXY_PORT: 8001
+  LLAMA_PORT: 8080
 
 jobs:
   queen:
@@ -23,7 +24,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y jq curl git build-essential cmake python3 python3-pip nodejs npm
           sudo npm install -g holesail
-          pip3 install fastapi uvicorn httpx pyyaml
+          sudo npm install -g mcp-proxy
 
       - name: Build llama.cpp with MCP support
         run: |
@@ -40,40 +41,95 @@ jobs:
         run: |
           curl -L -o model.gguf "https://huggingface.co/${{ env.QUEEN_MODEL }}" -f --retry 3
 
-      - name: Start MCP proxy (from repo)
-        run: |
-          chmod +x mcp_proxy.py
-          python3 mcp_proxy.py &
-          sleep 10
-          echo "✅ MCP proxy started on port ${{ env.PROXY_PORT }}"
-
-      - name: Wait for initial workers to register
-        run: |
-          echo "Waiting for workers to register..."
-          sleep 30
-
-      - name: Start llama-server with proxy (no --system-prompt)
+      - name: Wait for workers and collect Holesail URLs
         env:
-          MCP_ENDPOINTS: "http://localhost:${{ env.PROXY_PORT }}/mcp"
+          GH_TOKEN: ${{ secrets.TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
-          echo "🌐 Starting llama-server with MCP proxy: $MCP_ENDPOINTS"
+          echo "👑 Queen waiting for workers..."
+          EXPECTED=$(ls -1 skills/*.yaml 2>/dev/null | wc -l)
+          [ $EXPECTED -eq 0 ] && echo "No skills found" && exit 1
+          echo "Expecting $EXPECTED workers (one per skill)."
+          HOLESAIL_URLS=""
+          for attempt in {1..120}; do
+            RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/contents/workers" 2>/dev/null)
+            REGISTERED_FILES=$(echo "$RESPONSE" | jq -r '.[] | select(.type == "file" and (.name | endswith(".json"))) | .name' 2>/dev/null)
+            REGISTERED_COUNT=$(echo "$REGISTERED_FILES" | grep -c . || echo 0)
+            echo "  Attempt $attempt: $REGISTERED_COUNT / $EXPECTED workers registered"
+            if [ "$REGISTERED_COUNT" -ge "$EXPECTED" ]; then
+              echo "✅ All workers registered!"
+              break
+            fi
+            sleep 5
+          done
+
+          for file in $REGISTERED_FILES; do
+            curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${REPO}/contents/workers/${file}" \
+              > /tmp/worker.json
+            URL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.url' 2>/dev/null)
+            SKILL=$(jq -r '.content' /tmp/worker.json | base64 -d | jq -r '.skill' 2>/dev/null)
+            if [ -n "$URL" ] && [ "$URL" != "null" ] && [ -n "$SKILL" ] && [ "$SKILL" != "null" ]; then
+              HOLESAIL_URLS="${HOLESAIL_URLS} ${SKILL}:$URL"
+            fi
+          done
+          if [ -z "$HOLESAIL_URLS" ]; then
+            echo "❌ No valid worker URLs"
+            exit 1
+          fi
+          echo "HOLESAIL_URLS=$HOLESAIL_URLS" >> $GITHUB_ENV
+
+      - name: Connect to workers and start mcp-proxy aggregator
+        env:
+          HOLESAIL_URLS: ${{ env.HOLESAIL_URLS }}
+        run: |
+          echo "🔗 Connecting to workers and building mcp-proxy config..."
+          CONFIG_JSON='{"mcpServers": {}}'
+          IFS=' ' read -ra PAIRS <<< "${HOLESAIL_URLS}"
+          LOCAL_PORT=6000
+          for pair in "${PAIRS[@]}"; do
+            SKILL="${pair%:*}"
+            URL="${pair#*:}"
+            echo "Connecting $SKILL -> $URL to localhost:$LOCAL_PORT"
+            holesail "$URL" --port $LOCAL_PORT &
+            CONFIG_JSON=$(echo "$CONFIG_JSON" | jq ".mcpServers[\"$SKILL\"] = {\"url\": \"http://localhost:$LOCAL_PORT/mcp\"}")
+            LOCAL_PORT=$((LOCAL_PORT + 1))
+          done
+          echo "$CONFIG_JSON" > mcp_config.json
+          echo "✅ mcp-proxy config created."
+
+          echo "Starting mcp-proxy on port ${{ env.PROXY_PORT }}..."
+          npx mcp-proxy \
+            --named-server-config mcp_config.json \
+            --allow-origin "*" \
+            --port ${{ env.PROXY_PORT }} \
+            --stateless \
+            &
+          sleep 10
+          echo "✅ mcp-proxy running."
+
+      - name: Start llama-server with WebUI and MCP proxy
+        run: |
+          echo "🌐 Starting llama-server with WebUI and MCP proxy (port ${{ env.PROXY_PORT }})"
           ./llama-server \
             -m model.gguf \
             -c 4096 \
             -ngl 0 \
             --host 0.0.0.0 \
-            --port 8080 \
-            --webui-mcp-proxy "$MCP_ENDPOINTS" \
+            --port ${{ env.LLAMA_PORT }} \
+            --webui-mcp-proxy \
             &
 
           for i in {1..60}; do
-            if curl -s http://localhost:8080/health > /dev/null; then
+            if curl -s http://localhost:${{ env.LLAMA_PORT }}/health > /dev/null; then
               echo "✅ Server ready"
               break
             fi
             sleep 2
           done
-          if ! curl -s http://localhost:8080/health > /dev/null; then
+          if ! curl -s http://localhost:${{ env.LLAMA_PORT }}/health > /dev/null; then
             echo "❌ Server failed"
             exit 1
           fi
@@ -83,7 +139,7 @@ jobs:
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
             chmod +x cloudflared
           fi
-          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8080 > tunnel.log 2>&1 &
+          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:${{ env.LLAMA_PORT }} > tunnel.log 2>&1 &
           for i in {1..30}; do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$TUNNEL_URL" ]; then
