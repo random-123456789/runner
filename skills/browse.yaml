@@ -1,0 +1,11 @@
+name: browser_navigate
+description: "Navigate to a URL and get page content."
+parameters:
+  type: object
+  properties:
+    url:
+      type: string
+  required: ["url"]
+mcp_server: "npx @playwright/mcp@latest"
+server_args: "--headless --browser chromium"
+port: 50052
