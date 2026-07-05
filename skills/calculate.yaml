@@ -8,3 +8,4 @@ parameters:
   required: ["expr"]
 mcp_server: "python3 -c \"from fastmcp import FastMCP; m=FastMCP('calc'); @m.tool(); def calculate(expr): return str(eval(expr)); m.run(host='0.0.0.0', port=50054)\""
 port: 50054
+
