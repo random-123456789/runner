@@ -63,7 +63,7 @@ jobs:
             -ngl 0 \
             --host 0.0.0.0 \
             --port 8080 \
-            --mcp "$MCP_ENDPOINTS" \
+            --webui-mcp-proxy "$MCP_ENDPOINTS" \
             &
 
           for i in {1..60}; do
