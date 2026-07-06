@@ -1,0 +1,3 @@
+mcp_server: "uvx"
+server_args: "mcp-server-summarize"
+port: 50054
