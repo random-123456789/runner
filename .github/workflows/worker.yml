@@ -73,8 +73,9 @@ jobs:
             exit 1
           fi
 
-          # ---------- REGISTER WITH QUEEN ----------
+          # ---------- REGISTER WITH QUEEN (save to workers/ directory) ----------
           WORKER_FILE="workers/${SKILL_NAME}.json"
+          mkdir -p workers
           echo "{\"skill\": \"${SKILL_NAME}\", \"url\": \"${TUNNEL_URL}/mcp\"}" > ${WORKER_FILE}
           ENCODED=$(base64 -w0 ${WORKER_FILE})
 
@@ -95,7 +96,7 @@ jobs:
               "https://api.github.com/repos/${REPO}/contents/${WORKER_FILE}" \
               -d "$PAYLOAD")
             if echo "$RESPONSE" | jq -e '.content' > /dev/null; then
-              echo "✅ Worker registered with URL: $TUNNEL_URL"
+              echo "✅ Worker registered with URL: $TUNNEL_URL/mcp"
               break
             fi
             sleep 3
