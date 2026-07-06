@@ -1,114 +1,125 @@
-name: Queen Orchestrator
+name: OpenClaw + Ollama (granite4:tiny-h)
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: write
-  actions: write
-
-env:
-  MAX_WORKERS: 19
-  OLLAMA_MODEL: granite4:tiny-h
-  GATEWAY_PORT: 18789
-  SCRIPT_DIR: /tmp/queen
+  push:
+    branches: [main]
 
 jobs:
-  queen:
+  openclaw:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 30
+    env:
+      # Local loopback marker — no real key needed for a self-hosted Ollama
+      OLLAMA_API_KEY: "ollama-local"
+      OLLAMA_HOST: "127.0.0.1:11434"
+      # OpenClaw will read num_ctx from /api/show on the model below
+      OPENCLAW_MODEL: "ollama/granite4:tiny-h-64k"
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y curl git nodejs npm python3 python3-pip jq
-          curl -fsSL https://ollama.com/install.sh | sh
-          sudo npm install -g openclaw
-          echo "/usr/local/bin" >> $GITHUB_PATH
-          curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x cloudflared
+      # --- 1. Node (OpenClaw needs Node 22.19+ or 24) ---------------------
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
 
-      - name: Start Ollama
-        run: |
-          ollama serve &
-          sleep 5
-          ollama pull ${{ env.OLLAMA_MODEL }}
+      # --- 2. Install Ollama ------------------------------------------------
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
 
-      - name: Setup scripts
+      # --- 3. Start ollama serve in background, wait until ready -----------
+      - name: Start Ollama server
         run: |
-          mkdir -p ${{ env.SCRIPT_DIR }}
-          cp scripts/* ${{ env.SCRIPT_DIR }}/ 2>/dev/null || true
-          chmod +x ${{ env.SCRIPT_DIR }}/*.sh
-
-      # ----- FIXED: Use openclaw config set to build valid config -----
-      - name: Configure OpenClaw
-        env:
-          SCRIPT_DIR: ${{ env.SCRIPT_DIR }}
-        run: |
-          mkdir -p ~/.openclaw
-          # Set model provider
-          openclaw config set models.ollama.baseUrl "http://localhost:11434"
-          openclaw config set models.ollama.defaultModel "${{ env.OLLAMA_MODEL }}"
-          # Set default agent
-          openclaw config set agents.default.model "ollama/${{ env.OLLAMA_MODEL }}"
-          openclaw config set agents.default.systemPrompt "You are a helpful assistant. When a user asks a question that requires research, summarization, data processing, or any non-trivial task, use the 'run_worker' skill. Always delegate complex tasks to workers. Never try to answer complex questions yourself."
-          # Define skill
-          openclaw config set skills.run_worker.type "command"
-          openclaw config set skills.run_worker.command "$SCRIPT_DIR/worker_launcher.sh"
-          openclaw config set skills.run_worker.description "Execute a query in a temporary GitHub Actions worker. Returns the result."
-          openclaw config set skills.run_worker.parameters.query.type "string"
-          openclaw config set skills.run_worker.parameters.query.description "The exact user query to be executed"
-          # Attach skill to default agent
-          openclaw config set agents.default.skills '["run_worker"]'
-          # Gateway port
-          openclaw config set gateway.port ${{ env.GATEWAY_PORT }}
-          # Validate
-          openclaw config validate
-
-      - name: Start Gateway
-        run: |
-          openclaw gateway start &
-          sleep 5
-          for i in {1..20}; do
-            if curl -s http://localhost:${{ env.GATEWAY_PORT }}/health > /dev/null; then
-              echo "✅ Gateway ready"
+          # Run detached, log to file
+          nohup ollama serve > /tmp/ollama.log 2>&1 &
+          echo $! > /tmp/ollama.pid
+          # Poll /api/tags — there is no `ollama ready` command
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+              echo "Ollama ready after ${i} attempts"
               break
             fi
+            [ $i -eq 30 ] && { echo "Ollama failed to start"; cat /tmp/ollama.log; exit 1; }
             sleep 2
           done
 
-      - name: Start Cloudflare Tunnel
-        id: tunnel
+      # --- 4. Build a 64k-context variant (OpenClaw wants >=64k ctx) ------
+      - name: Pull model & extend context window
         run: |
-          nohup ./cloudflared tunnel --url http://localhost:${{ env.GATEWAY_PORT }} > tunnel.log 2>&1 &
-          for i in {1..30}; do
-            URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$URL" ]; then echo "tunnel_url=$URL" >> $GITHUB_OUTPUT; break; fi
-            sleep 3
+          ollama pull granite4:tiny-h
+          # granite4:tiny-h ships a small default ctx; raise it for OpenClaw
+          printf 'FROM granite4:tiny-h\nPARAMETER num_ctx 65536\n' > /tmp/Modelfile
+          ollama create granite4:tiny-h-64k -f /tmp/Modelfile
+          ollama list
+
+      # --- 5. Install OpenClaw CLI -----------------------------------------
+      - name: Install OpenClaw
+        run: |
+          npm install -g openclaw@latest
+          openclaw --version
+
+      # --- 6. Non-interactive onboarding (Ollama, local mode) -------------
+      - name: Onboard OpenClaw (headless)
+        run: |
+          openclaw onboard --non-interactive --accept-risk \
+            --mode local \
+            --auth-choice ollama \
+            --custom-base-url "http://127.0.0.1:11434" \
+            --custom-model-id "granite4:tiny-h-64k" \
+            --gateway-bind loopback \
+            --skip-bootstrap \
+            --skip-skills
+
+      # --- 7. Pin the model explicitly in config ---------------------------
+      - name: Set primary model
+        run: |
+          openclaw config set models.providers.ollama.baseUrl "http://127.0.0.1:11434"
+          openclaw config set models.providers.ollama.apiKey "ollama-local"
+          openclaw config set agents.defaults.model.primary "ollama/granite4:tiny-h-64k"
+          openclaw models list --provider ollama
+
+      # --- 8. Start gateway in background, wait for /health ---------------
+      - name: Start OpenClaw gateway
+        run: |
+          nohup openclaw gateway run --port 18789 > /tmp/openclaw-gw.log 2>&1 &
+          echo $! > /tmp/gw.pid
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:18789/health >/dev/null 2>&1; then
+              echo "Gateway ready after ${i} attempts"
+              break
+            fi
+            [ $i -eq 30 ] && { echo "Gateway failed"; cat /tmp/openclaw-gw.log; exit 1; }
+            sleep 2
           done
 
-      - name: Update allowed origins
-        env:
-          TUNNEL_URL: ${{ steps.tunnel.outputs.tunnel_url }}
+      # --- 9. Run the agent -------------------------------------------------
+      - name: Run OpenClaw agent
         run: |
-          openclaw config set gateway.controlUi.allowedOrigins '["'"$TUNNEL_URL"'"]'
-          pkill -f "openclaw gateway" || true
-          sleep 2
-          openclaw gateway start &
-          sleep 5
+          openclaw agent --local --agent main --timeout 300 \
+            --message "Reply with exactly: pong from granite4"
 
-      - name: Print access
+      # --- 10. (Alternative) one-shot inference smoke test -----------------
+      # Use this instead of the gateway+agent step for a minimal check.
+      # - name: Smoke test infer
+      #   run: |
+      #     openclaw infer model run --local \
+      #       --model ollama/granite4:tiny-h-64k \
+      #       --prompt "Reply with exactly: pong" --json
+
+      # --- 11. Cleanup & artifacts -----------------------------------------
+      - name: Stop services
+        if: always()
         run: |
-          echo "================================================================="
-          echo "🌐 OpenClaw Web UI: ${{ steps.tunnel.outputs.tunnel_url }}"
-          echo ""
-          echo "📋 Configuration:"
-          echo "   - Model: ${{ env.OLLAMA_MODEL }}"
-          echo "   - Max workers: ${{ env.MAX_WORKERS }}"
-          echo "   - Gateway port: ${{ env.GATEWAY_PORT }}"
-          echo ""
-          echo "💡 Just ask anything. The Queen will automatically create workers."
-          echo "================================================================="
-          sleep infinity
+          kill $(cat /tmp/gw.pid 2>/dev/null)      2>/dev/null || true
+          kill $(cat /tmp/ollama.pid 2>/dev/null)  2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-logs
+          path: |
+            /tmp/ollama.log
+            /tmp/openclaw-gw.log
+            ~/.openclaw/logs/
+          retention-days: 7
