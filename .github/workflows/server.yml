@@ -2,66 +2,103 @@ name: OpenClaw + Ollama (granite4:tiny-h)
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
   pull_request:
-    branches: ["main"]
+    branches: [ "main" ]
 
 jobs:
-  openclaw:
+  test-hive:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - name: Checkout Repository
+      uses: actions/checkout@v4
 
-      - name: Set up Node 24
-        uses: actions/setup-node@v4
-        with:
-          node-version: '24'
+    - name: Set up Node.js 24
+      uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+        check-latest: true
 
-      - name: Install Ollama
-        run: curl -fsSL https://ollama.com/install.sh | sh
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
 
-      - name: Start Ollama service
-        run: |
-          nohup ollama serve > ollama.log 2>&1 &
-          sleep 5
+    - name: Install Python Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyyaml ollama
 
-      - name: Pull granite4:tiny-h
-        run: ollama pull granite4:tiny-h
+    - name: Install Ollama
+      run: curl -fsSL https://ollama.com/install.sh | sh
 
-      - name: Install OpenClaw
-        run: npm install -g openclaw@latest
+    - name: Start Ollama Service
+      run: |
+        nohup ollama serve > ollama.log 2>&1 &
+        sleep 5
 
-      # ---- NEW: start the gateway BEFORE onboarding ----
-      - name: Start OpenClaw gateway (background)
-        run: |
-          nohup openclaw gateway run \
-            --bind loopback \
-            --port 18789 \
-            > gateway.log 2>&1 &
+    - name: Wait for Ollama to be ready
+      run: |
+        for i in $(seq 1 30); do
+          if nc -z 127.0.0.1 11434; then
+            echo "Ollama is up."
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "Ollama failed to start"; cat ollama.log; exit 1
 
-      - name: Wait for gateway to be reachable
-        run: |
-          for i in $(seq 1 60); do
-            if nc -z 127.0.0.1 18789; then
-              echo "Gateway is up after ${i}s"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "Gateway failed to start"; cat gateway.log; exit 1
+    - name: Pull granite4:tiny-h model
+      run: ollama pull granite4:tiny-h
 
-      - name: Onboard (non-interactive, Ollama provider)
-        run: |
-          openclaw onboard --non-interactive --accept-risk \
-            --mode local \
-            --auth-choice ollama \
-            --custom-model-id "granite4:tiny-h" \
-            --gateway-bind loopback \
-            --skip-bootstrap \
-            --skip-skills
+    - name: Install OpenClaw CLI
+      run: npm install -g openclaw@latest
 
-      - name: Verify
-        run: |
-          openclaw status
-          openclaw gateway status
+    # -------------------------------------------------------------
+    # FIX: Start the OpenClaw Gateway in the background BEFORE onboard
+    # -------------------------------------------------------------
+    - name: Start OpenClaw Gateway (Background)
+      run: |
+        nohup openclaw gateway run --bind loopback --port 18789 > gateway.log 2>&1 &
+
+    - name: Wait for OpenClaw Gateway to be reachable
+      run: |
+        for i in $(seq 1 60); do
+          if nc -z 127.0.0.1 18789; then
+            echo "OpenClaw Gateway is up after ${i}s."
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "Gateway failed to start"; cat gateway.log; exit 1
+
+    - name: OpenClaw Onboard (Non-interactive with Ollama)
+      run: |
+        openclaw onboard --non-interactive --accept-risk \
+          --mode local \
+          --auth-choice ollama \
+          --custom-model-id "granite4:tiny-h" \
+          --gateway-bind loopback \
+          --skip-bootstrap \
+          --skip-skills \
+          --skip-channels
+
+    - name: Verify OpenClaw Status
+      run: |
+        openclaw status
+        openclaw gateway status
+
+    # -------------------------------------------------------------
+    # TEST: Run the ephemeral Worker script to validate the architecture
+    # -------------------------------------------------------------
+    - name: Create Mock worker.yaml for Testing
+      run: |
+        echo 'worker_id: "github-test-worker"' > test_worker.yaml
+        echo 'model: "granite4:tiny-h"' >> test_worker.yaml
+        echo 'task: "Write a hello world python script."' >> test_worker.yaml
+        echo 'api_secret: "GH-ACTION-SECRET"' >> test_worker.yaml
+        echo 'holesail_port: 9101' >> test_worker.yaml
+        echo 'master_secret: "TEST-MASTER"' >> test_worker.yaml
+
+    - name: Run Worker Test
+      run: python worker.py test_worker.yaml
