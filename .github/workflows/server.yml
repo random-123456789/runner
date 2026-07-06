@@ -107,16 +107,32 @@ jobs:
           echo "$CONFIG_JSON" > mcp_config.json
           echo "✅ mcp-proxy config created."
 
+      # ============ FIX 1: Add --transport streamablehttp and health check ============
       - name: Start mcp-proxy aggregator
         run: |
-          echo "Starting mcp-proxy on port ${{ env.MCP_PROXY_PORT }}..."
+          echo "Starting mcp-proxy on port ${{ env.MCP_PROXY_PORT }} with streamable HTTP..."
           mcp-proxy \
             --named-server-config mcp_config.json \
             --allow-origin "*" \
             --port ${{ env.MCP_PROXY_PORT }} \
             --stateless \
+            --transport streamablehttp \
             &
-          sleep 10
+          # Wait for proxy to be ready
+          for i in {1..15}; do
+            if curl -s -o /dev/null -w "%{http_code}" http://localhost:${{ env.MCP_PROXY_PORT }}/servers/calculate/mcp | grep -q "200\|405"; then
+              echo "✅ mcp-proxy is ready."
+              break
+            fi
+            echo "⏳ Waiting for mcp-proxy... ($i/15)"
+            sleep 2
+          done
+          # Send a test initialize request to verify it speaks JSON-RPC
+          echo "Testing mcp-proxy with initialize..."
+          curl -X POST http://localhost:${{ env.MCP_PROXY_PORT }}/servers/calculate/mcp \
+            -H "Content-Type: application/json" \
+            -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"1.0"},"id":1}' \
+            || echo "⚠️ Test failed, but continuing."
           echo "✅ mcp-proxy running."
 
       - name: Start llama-server with WebUI and MCP proxy
@@ -172,8 +188,8 @@ jobs:
           echo "::notice::MCP servers available at: $TUNNEL_URL/servers/<skill>/mcp"
           echo "----------------------------------------------------------------"
           echo "📋 MANUAL STEP: In the WebUI, go to Settings → MCP → Add New Server"
-          echo "   For each skill, add: $TUNNEL_URL/servers/<skill>/mcp"
-          echo "   Example: $TUNNEL_URL/servers/calculate/mcp"
+          echo "   For each skill, add: http://localhost:8001/servers/<skill>/mcp"
+          echo "   (NOT the cloudflare URL!)"
           echo "   Then click Edit on each and toggle 'Use llama-server proxy' ON."
           echo "----------------------------------------------------------------"
           sleep infinity  # keep the runner alive
