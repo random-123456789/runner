@@ -9,7 +9,6 @@ permissions:
 
 env:
   QUEEN_MODEL: "bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"
-  MCP_PROXY_PORT: 8001
   LLAMA_PORT: 8080
 
 jobs:
@@ -51,6 +50,7 @@ jobs:
           EXPECTED=$(ls -1 skills/*.yaml 2>/dev/null | wc -l)
           [ $EXPECTED -eq 0 ] && echo "No skills found" && exit 1
           echo "Expecting $EXPECTED workers (one per skill)."
+          
           WORKER_URLS=""
           for attempt in {1..120}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
@@ -66,6 +66,7 @@ jobs:
             sleep 5
           done
 
+          # Read all worker URLs
           for file in $REGISTERED_FILES; do
             curl -s -H "Authorization: Bearer $GH_TOKEN" \
               "https://api.github.com/repos/${REPO}/contents/workers/${file}" \
@@ -81,108 +82,6 @@ jobs:
             exit 1
           fi
           echo "WORKER_URLS=$WORKER_URLS" >> $GITHUB_ENV
-
-      - name: Create aggregator mapping (pointing to public Cloudflare URLs)
-        env:
-          WORKER_URLS: ${{ env.WORKER_URLS }}
-        run: |
-          echo "🔗 Building aggregator mapping to worker Cloudflare tunnels..."
-          CONFIG_JSON='{"mcpServers": {}}'
-          IFS=' ' read -ra PAIRS <<< "${WORKER_URLS}"
-          for pair in "${PAIRS[@]}"; do
-            SKILL="${pair%:*}"
-            URL="${pair#*:}"
-            # Sanitize skill name
-            SKILL_CLEAN=$(echo "$SKILL" | tr ':' '_')
-            echo "Mapping $SKILL_CLEAN -> $URL"
-            CONFIG_JSON=$(echo "$CONFIG_JSON" | jq ".mcpServers[\"$SKILL_CLEAN\"] = {\"url\": \"$URL\"}")
-          done
-          echo "$CONFIG_JSON" > mcp_mapping.json
-          echo "✅ Mapping created."
-
-      - name: Create aggregator script
-        run: |
-          cat > aggregator.py << 'EOF'
-          import json
-          import http.server
-          import socketserver
-          import urllib.request
-          import urllib.error
-          import os
-          import re
-
-          PORT = int(os.environ.get('PROXY_PORT', 8001))
-
-          with open('mcp_mapping.json', 'r') as f:
-              config = json.load(f)
-          mapping = {}
-          for skill, server in config.get('mcpServers', {}).items():
-              url = server.get('url')
-              if url:
-                  mapping[skill] = url
-
-          class ProxyHandler(http.server.BaseHTTPRequestHandler):
-              def do_GET(self):
-                  self.send_response(405)
-                  self.end_headers()
-              
-              def do_POST(self):
-                  path = self.path
-                  m = re.match(r'^/servers/([^/]+)/mcp/?$', path)
-                  if not m:
-                      self.send_response(404)
-                      self.end_headers()
-                      self.wfile.write(b'Not Found')
-                      return
-                  skill = m.group(1)
-                  if skill not in mapping:
-                      self.send_response(404)
-                      self.end_headers()
-                      self.wfile.write(b'Skill not found')
-                      return
-                  target_url = mapping[skill]
-                  content_length = int(self.headers.get('Content-Length', 0))
-                  body = self.rfile.read(content_length) if content_length > 0 else b''
-                  req = urllib.request.Request(target_url, data=body, method='POST')
-                  for header, value in self.headers.items():
-                      if header.lower() not in ('host', 'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding'):
-                          req.add_header(header, value)
-                  try:
-                      with urllib.request.urlopen(req) as response:
-                          self.send_response(response.status)
-                          for header, value in response.headers.items():
-                              if header.lower() not in ('connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'content-length'):
-                                  self.send_header(header, value)
-                          self.end_headers()
-                          self.wfile.write(response.read())
-                  except urllib.error.URLError as e:
-                      self.send_response(502)
-                      self.end_headers()
-                      self.wfile.write(f'Proxy error: {e}'.encode())
-
-          def run():
-              server_address = ('', PORT)
-              httpd = socketserver.ThreadingTCPServer(server_address, ProxyHandler)
-              print(f'✅ Aggregator listening on port {PORT}')
-              httpd.serve_forever()
-
-          if __name__ == '__main__':
-              run()
-          EOF
-
-      - name: Start aggregator
-        run: |
-          echo "Starting aggregator on port ${{ env.MCP_PROXY_PORT }}..."
-          python3 aggregator.py &
-          sleep 5
-          for i in {1..10}; do
-            if curl -s -o /dev/null -w "%{http_code}" http://localhost:${{ env.MCP_PROXY_PORT }}/servers/calculate/mcp | grep -q "200\|405"; then
-              echo "✅ Aggregator ready."
-              break
-            fi
-            echo "⏳ Waiting for aggregator... ($i/10)"
-            sleep 2
-          done
 
       - name: Start llama-server with WebUI and MCP proxy
         run: |
@@ -232,15 +131,24 @@ jobs:
       - name: Print instructions
         env:
           TUNNEL_URL: ${{ steps.tunnel.outputs.tunnel_url }}
+          WORKER_URLS: ${{ env.WORKER_URLS }}
         run: |
           echo "::notice::Frontend URL: $TUNNEL_URL"
           echo "----------------------------------------------------------------"
           echo "📋 MANUAL STEP: In the WebUI, go to Settings → MCP → Add New Server"
-          echo "   For each skill, use THIS URL:"
-          echo "   http://localhost:${{ env.MCP_PROXY_PORT }}/servers/<skill>/mcp"
-          echo "   Example: http://localhost:${{ env.MCP_PROXY_PORT }}/servers/calculate/mcp"
           echo ""
-          echo "   Then click Edit on each and toggle 'Use llama-server proxy' ON."
-          echo "   (This works around the known llama.cpp URL parsing bug.)"
+          echo "   Add each worker's EXTERNAL Cloudflare URL directly:"
+          echo ""
+          IFS=' ' read -ra PAIRS <<< "${WORKER_URLS}"
+          for pair in "${PAIRS[@]}"; do
+            SKILL="${pair%:*}"
+            URL="${pair#*:}"
+            echo "   Skill '$SKILL' → $URL"
+            echo "   (Add this URL in the WebUI)"
+          done
+          echo ""
+          echo "   IMPORTANT: For each server, toggle 'Use llama-server proxy' ON."
+          echo "   This makes llama-server fetch the external URL server-side,"
+          echo "   avoiding browser CORS issues."
           echo "----------------------------------------------------------------"
           sleep infinity
