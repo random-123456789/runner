@@ -20,41 +20,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # -------- Phase 1: Install dependencies --------
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl git nodejs npm python3 python3-pip jq
           curl -fsSL https://ollama.com/install.sh | sh
-          npm install -g openclaw
-          echo "$(npm root -g)/bin" >> $GITHUB_PATH
+          # Install OpenClaw globally with sudo
+          sudo npm install -g openclaw
+          # Ensure openclaw is in PATH
+          echo "/usr/local/bin" >> $GITHUB_PATH
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # -------- Phase 2: Start Ollama --------
       - name: Start Ollama
         run: |
           ollama serve &
           sleep 5
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # -------- Phase 3: Setup scripts directory --------
       - name: Setup scripts
         run: |
           mkdir -p ${{ env.QUEEN_SCRIPT_DIR }}
           cp -r scripts/* ${{ env.QUEEN_SCRIPT_DIR }}/ 2>/dev/null || true
           chmod +x ${{ env.QUEEN_SCRIPT_DIR }}/*.sh
 
-      # -------- Phase 4: Configure OpenClaw --------
       - name: Configure OpenClaw
         env:
           SCRIPT_DIR: ${{ env.QUEEN_SCRIPT_DIR }}
         run: |
           mkdir -p ~/.openclaw
-          # Inject script paths into config
           sed "s|__SCRIPT_DIR__|$SCRIPT_DIR|g" config/openclaw.json > ~/.openclaw/openclaw.json
 
-      # -------- Phase 5: Start OpenClaw Gateway --------
       - name: Start Gateway
         run: |
           openclaw gateway start --port ${{ env.GATEWAY_PORT }} &
@@ -66,7 +62,6 @@ jobs:
             sleep 2
           done
 
-      # -------- Phase 6: Start Cloudflare Tunnel --------
       - name: Start Cloudflare Tunnel
         id: tunnel
         run: |
@@ -77,7 +72,6 @@ jobs:
             sleep 3
           done
 
-      # -------- Phase 7: Update allowed origins --------
       - name: Update allowed origins
         env:
           TUNNEL_URL: ${{ steps.tunnel.outputs.tunnel_url }}
@@ -88,7 +82,6 @@ jobs:
           openclaw gateway start --port ${{ env.GATEWAY_PORT }} &
           sleep 5
 
-      # -------- Phase 8: Print access info --------
       - name: Print access
         run: |
           echo "================================================================="
