@@ -53,9 +53,13 @@ jobs:
             --no-open \
             --skip-build > hermes_dashboard.log 2>&1 &
           
-          # Health check
+          echo "Waiting for dashboard to be responsive..."
           for i in {1..20}; do
-            if nc -z 127.0.0.1 ${{ env.HERMES_DASHBOARD_PORT }}; then break; fi
+            if curl -s http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} > /dev/null; then
+              echo "Dashboard is up!"
+              break
+            fi
+            echo "Waiting for dashboard... ($i/10)"
             sleep 3
           done
 
