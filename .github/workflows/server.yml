@@ -69,16 +69,18 @@ jobs:
           sleep 15
           docker logs hermes-dashboard
 
-      # 5. Direct the Cloudflare Tunnel client container to target the isolated dashboard host
+      # 5. Direct the Cloudflare Tunnel client with Host Header Override patches
       - name: Start Cloudflare Tunnel Container
         id: tunnel
         run: |
-          # Drop 'run' subcommand to explicitly trigger free Quick Tunnel allocations
+          # Added --http-header override to satisfy the dashboard's strict host boundary checks
           docker run -d \
             --name cloudflared-tunnel \
             --network hermes-net \
             cloudflare/cloudflared:latest \
-            tunnel --url http://hermes-dashboard:${{ env.HERMES_DASHBOARD_PORT }}
+            tunnel \
+            --url http://hermes-dashboard:${{ env.HERMES_DASHBOARD_PORT }} \
+            --http-header "Host: hermes-dashboard:${{ env.HERMES_DASHBOARD_PORT }}"
 
           echo "⏳ Catching dynamic public edge route URL..."
           # Active loop to reliably catch the ephemeral address from container logs
