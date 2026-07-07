@@ -19,11 +19,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Faster, tool-based Ollama engine configuration
+      # 1. Clean, tool-based Ollama engine configuration
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
 
-      # 2. Caches the heavy model weights directory to drop execution times drastically
+      # 2. Cache model weights directory to skip downloading on future runs
       - name: Cache Ollama Model Weights
         uses: actions/cache@v4
         with:
@@ -63,11 +63,10 @@ jobs:
           EOF
           chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
 
-      # 3. Utilizing your working 'ollama launch openclaw' approach
+      # 3. Parameter-injected headless launch to completely clear the origin policy wall
       - name: Launch OpenClaw Gateway via Ollama wrapper
         run: |
-          export OPENCLAW_GATEWAY_CONTROL_UI_DISABLE_ORIGIN_CHECK="true"
-          nohup ollama launch openclaw --model ${{ env.OLLAMA_MODEL }} --yes > openclaw.log 2>&1 &
+          nohup ollama launch openclaw --model ${{ env.OLLAMA_MODEL }} --yes --arg "gateway.controlUi.disableOriginCheck=true" > openclaw.log 2>&1 &
           
           echo "⏳ Waiting for OpenClaw Gateway to bind to port ${{ env.GATEWAY_PORT }}..."
           for i in {1..20}; do
