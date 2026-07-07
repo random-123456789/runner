@@ -10,8 +10,7 @@ permissions:
 env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
-  HERMES_DASHBOARD_PORT: 9119
-  NGINX_PROXY_PORT: 8080
+  HERMES_LAUNCH_PORT: 9119
 
 jobs:
   queen:
@@ -20,11 +19,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Provision system binaries, Nginx, and cloudflared
+      # 1. Provision essential system tools and download cloudflared
       - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl python3-pip python3-venv netcat-openbsd nginx
+          sudo apt-get install -y curl netcat-openbsd
           
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
@@ -38,99 +37,30 @@ jobs:
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # 4. Install official hermes-agent
-      - name: Install Official Hermes Agent
+      # 4. Launch Hermes inside the unified Ollama context
+      - name: Unified Ollama Hermes Launch
         run: |
-          python3 -m pip install --upgrade pip
-          pip install "hermes-agent[web,pty]"
-
-      # 5. Pre-seed local environment configurations
-      - name: Pre-configure Hermes Runtime Environment
-        run: |
-          mkdir -p ~/.hermes
-          cat << 'EOF' > ~/.hermes/config.yaml
-          provider: "ollama"
-          model: "granite4:tiny-h"
-          providers:
-            ollama:
-              base_url: "http://127.0.0.1:11434"
-          EOF
-
-      # 6. Configure Nginx with split route handling for WebSocket upgrades
-      - name: Configure Nginx Reverse Proxy
-        run: |
-          cat << 'EOF' | sudo tee /etc/nginx/sites-available/default > /dev/null
-          server {
-              listen 8080 default_server;
-              listen [::]:8080 default_server;
-
-              # 1. Standard Web / API Requests
-              location / {
-                  proxy_pass http://127.0.0.1:9119;
-                  
-                  # Keep Hermes happy on basic page requests
-                  proxy_set_header Host 127.0.0.1:9119;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-                  
-                  proxy_buffering off;
-                  proxy_cache off;
-              }
-
-              # 2. Target WebSocket stream connections explicitly
-              location ~* /(ws|api/v1/events) {
-                  proxy_pass http://127.0.0.1:9119;
-                  
-                  # Forward the dynamic host so the WS handshake matches browser origin
-                  proxy_set_header Host $http_host;
-                  proxy_set_header X-Real-IP $remote_addr;
-                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                  proxy_set_header X-Forwarded-Proto $scheme;
-
-                  # Core WebSocket translation upgrades
-                  proxy_http_version 1.1;
-                  proxy_set_header Upgrade $http_upgrade;
-                  proxy_set_header Connection "upgrade";
-                  
-                  # Prevent streaming timeouts
-                  proxy_buffering off;
-                  proxy_read_timeout 86400s;
-                  proxy_send_timeout 86400s;
-              }
-          }
-          EOF
-          sudo systemctl restart nginx
-
-      # 7. Start Hermes Native Dashboard
-      - name: Start Hermes Native Dashboard
-        env:
-          HERMES_ALLOWED_ORIGINS: "*"
-          HERMES_ALLOWED_HOSTS: "*"
-          HERMES_DISABLE_CSRF: "true"
-          HERMES_INSECURE: "true"
-        run: |
-          nohup hermes dashboard \
-            --host 127.0.0.1 \
-            --port ${{ env.HERMES_DASHBOARD_PORT }} \
-            --no-open \
-            --skip-build > hermes_dashboard.log 2>&1 &
+          # Use the integrated app framework to serve the portal directly
+          nohup ollama launch hermes \
+            --model ${{ env.OLLAMA_MODEL }} \
+            --port ${{ env.HERMES_LAUNCH_PORT }} > hermes_launch.log 2>&1 &
           
-          echo "⏳ Waiting for dashboard to bind to 127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }}..."
+          echo "⏳ Waiting for unified portal to bind to port ${{ env.HERMES_LAUNCH_PORT }}..."
           for i in {1..30}; do
-            if nc -z 127.0.0.1 ${{ env.HERMES_DASHBOARD_PORT }} ; then
-              echo "✅ Dashboard is online!"
+            if nc -z 127.0.0.1 ${{ env.HERMES_LAUNCH_PORT }}; then
+              echo "✅ Hermes Launcher is online!"
               break
             fi
             sleep 3
           done
 
-      # 8. Point Cloudflare Tunnel directly to Nginx Proxy
+      # 5. Map Cloudflare tunnel directly to the launch port
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
+          # Clean tunnel passing straight to the wrapper engine
           nohup ./cloudflared tunnel \
-            --url http://127.0.0.1:${{ env.NGINX_PROXY_PORT }} \
+            --url http://127.0.0.1:${{ env.HERMES_LAUNCH_PORT }} \
             --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
@@ -144,7 +74,7 @@ jobs:
           done
           sleep 5
 
-      # 9. Print access route and maintain keep-alive
+      # 6. Print access route and maintain keep-alive
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           echo "================================================================="
