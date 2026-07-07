@@ -43,7 +43,7 @@ jobs:
           python3 -m pip install --upgrade pip
           pip install "hermes-agent[web,pty]"
 
-      # 5. Pre-seed local environment configurations & dashboard security overrides
+      # 5. Pre-seed local environment configurations
       - name: Pre-configure Hermes Runtime Environment
         run: |
           mkdir -p ~/.hermes
@@ -53,16 +53,16 @@ jobs:
           providers:
             ollama:
               base_url: "http://127.0.0.1:11434"
-          dashboard:
-            insecure: true
-            allowed_hosts:
-              - "*"
-            allowed_origins:
-              - "*"
           EOF
 
-      # 6. Bind to local loopback 
+      # 6. Bind to local loopback and strip Host/Origin checks via raw environment context
       - name: Start Hermes Native Dashboard
+        env:
+          HERMES_ALLOWED_ORIGINS: "*"
+          HERMES_ALLOWED_HOSTS: "*"
+          HERMES_DISABLE_CSRF: "true"
+          HERMES_INSECURE: "true"
+          ALLOWED_HOSTS: "*"
         run: |
           nohup hermes dashboard \
             --host 127.0.0.1 \
@@ -79,13 +79,13 @@ jobs:
             sleep 3
           done
 
-      # 7. Map Cloudflare tunnel natively without header modifications
+      # 7. Map Cloudflare tunnel and rewrite host header to match internal loopback requirements
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
-          # We remove --http-host-header to stop rewriting WebSocket upgrade packets
           nohup ./cloudflared tunnel \
             --url http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} \
+            --http-host-header 127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} \
             --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
