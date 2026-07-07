@@ -11,7 +11,6 @@ env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
   GATEWAY_PORT: 18789
-  SCRIPT_DIR: /tmp/queen
 
 jobs:
   queen:
@@ -20,95 +19,105 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
+      # 1. Install all runtime binaries & toolsets natively
+      - name: Install Queen Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl git nodejs npm python3 python3-pip jq
+          sudo apt-get install -y curl git nodejs npm jq netcat-openbsd
           curl -fsSL https://ollama.com/install.sh | sh
-          sudo npm install -g openclaw
-          echo "/usr/local/bin" >> $GITHUB_PATH
+          sudo npm install -g openclaw holesail
+          
+          # Fetch cloudflared binary directly
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      - name: Start Ollama
+      # 2. Fire up the base model weights engine 
+      - name: Start Ollama Engine
         run: |
           ollama serve &
           sleep 5
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      - name: Setup scripts
+      # 3. Provision skills directory & launch the gateway with origin overrides
+      - name: Launch OpenClaw Gateway via Ollama
         run: |
-          mkdir -p ${{ env.SCRIPT_DIR }}
-          cp scripts/* ${{ env.SCRIPT_DIR }}/ 2>/dev/null || true
-          chmod +x ${{ env.SCRIPT_DIR }}/*.sh
+          # Create custom skill workspace folder for your launcher script
+          mkdir -p ~/.openclaw/workspace/skills/run_worker
+          
+          # Register your custom agent skill tool via markdown manifest natively
+          cat << 'EOF' > ~/.openclaw/workspace/skills/run_worker/SKILL.md
+          # run_worker
+          
+          Execute a query in an autonomous, temporary GitHub Actions worker over Holesail.
+          
+          ## Configuration
+          - type: command
+          - command: /home/runner/work/runner/runner/scripts/worker_launcher.sh
+          
+          ## Parameters
+          - query (string): The precise task query to be executed by the worker.
+          EOF
 
-      - name: Configure OpenClaw
-        env:
-          SCRIPT_DIR: ${{ env.SCRIPT_DIR }}
-        run: |
-          mkdir -p ~/.openclaw
-          # Create default config (no --force)
-          openclaw config init
-          # Set Ollama provider
-          openclaw config set models.providers.ollama.baseUrl "http://localhost:11434"
-          openclaw config set models.providers.ollama.models '[{"id":"granite4:tiny-h","api":"ollama"}]'
-          # Set default agent
-          openclaw config set agents.default.model "ollama/granite4:tiny-h"
-          openclaw config set agents.default.systemPrompt "You are a helpful assistant. When a user asks a question that requires research, summarization, data processing, or any non-trivial task, use the 'run_worker' skill. Always delegate complex tasks to workers. Never try to answer complex questions yourself."
-          openclaw config set agents.default.skills '["run_worker"]'
-          # Define skill
-          openclaw config set skills.run_worker.type "command"
-          openclaw config set skills.run_worker.command "$SCRIPT_DIR/worker_launcher.sh"
-          openclaw config set skills.run_worker.description "Execute a query in a temporary GitHub Actions worker. Returns the result."
-          openclaw config set skills.run_worker.parameters.query.type "string"
-          openclaw config set skills.run_worker.parameters.query.description "The exact user query to be executed"
-          # Gateway port
-          openclaw config set gateway.port ${{ env.GATEWAY_PORT }}
-          # Validate
-          openclaw config validate
+          # Enforce execution permissions on your deployment script
+          chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
 
-      - name: Start OpenClaw Gateway
-        run: |
-          openclaw gateway start &
-          sleep 5
+          # A. Run via Ollama first to assemble initial environment parameters & profiles
+          ollama launch openclaw --model ${{ env.OLLAMA_MODEL }} --yes &
+          sleep 12
+          
+          # B. Gracefully kill the profile instance to free up the target ports
+          pkill -f "openclaw" || true
+          sleep 3
+
+          # C. Relaunch via pristine native binary to enforce clean global environment flags
+          export OPENCLAW_GATEWAY_PORT=${{ env.GATEWAY_PORT }}
+          export OPENCLAW_GATEWAY_CONTROL_UI_DISABLE_ORIGIN_CHECK="true"
+          
+          nohup openclaw gateway start > openclaw.log 2>&1 &
+          
+          echo "⏳ Waiting for OpenClaw Gateway to bind to port ${{ env.GATEWAY_PORT }}..."
           for i in {1..20}; do
-            if curl -s http://localhost:${{ env.GATEWAY_PORT }}/health > /dev/null; then
-              echo "✅ Gateway ready"
+            if curl -s http://127.0.0.1:${{ env.GATEWAY_PORT }} > /dev/null || [ $? -eq 52 ]; then
+              echo "✅ OpenClaw Gateway successfully verified online without origin checks!"
               break
             fi
-            sleep 2
-          done
-
-      - name: Start Cloudflare Tunnel
-        id: tunnel
-        run: |
-          nohup ./cloudflared tunnel --url http://localhost:${{ env.GATEWAY_PORT }} > tunnel.log 2>&1 &
-          for i in {1..30}; do
-            URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$URL" ]; then echo "tunnel_url=$URL" >> $GITHUB_OUTPUT; break; fi
+            echo "Keep waiting... ($i/20)"
             sleep 3
           done
 
-      - name: Update allowed origins
-        env:
-          TUNNEL_URL: ${{ steps.tunnel.outputs.tunnel_url }}
+      # 4. Bind the active upstream dynamic cloudflare proxy tunnel
+      - name: Start Cloudflare Tunnel Connection
+        id: tunnel
         run: |
-          openclaw config set gateway.controlUi.allowedOrigins '["'"$TUNNEL_URL"'"]'
-          pkill -f "openclaw gateway" || true
-          sleep 2
-          openclaw gateway start &
+          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.GATEWAY_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
+          
+          echo "⏳ Catching TryCloudflare edge address registration..."
+          for i in {1..20}; do
+            URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            if [ -n "$URL" ]; then 
+              echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
+              echo "Found address: $URL"
+              break
+            fi
+            sleep 3
+          done
+          
+          # Dynamic network buffer cooldown
           sleep 5
 
-      - name: Print access
+      # 5. Output active connection string & park runner execution path
+      - name: Print Orchestration Access Route & Keep Alive
         run: |
           echo "================================================================="
-          echo "🌐 OpenClaw Web UI: ${{ steps.tunnel.outputs.tunnel_url }}"
-          echo ""
-          echo "📋 Configuration:"
-          echo "   - Model: ${{ env.OLLAMA_MODEL }}"
-          echo "   - Max workers: ${{ env.MAX_WORKERS }}"
-          echo "   - Gateway port: ${{ env.GATEWAY_PORT }}"
-          echo ""
-          echo "💡 Just ask anything. The Queen will automatically create workers."
+          echo "🌐 OPENCLAW PORTAL ROUTE: ${{ steps.tunnel.outputs.tunnel_url }}"
           echo "================================================================="
+          echo ""
+          echo "--- LOG DIAGNOSTICS (OpenClaw Output Preview) ---"
+          head -n 40 openclaw.log || true
+          echo ""
+          echo "--- LOG DIAGNOSTICS (Cloudflared Output Preview) ---"
+          head -n 20 tunnel.log || true
+          echo "================================================================="
+          
+          # Hold runner pipeline open
           sleep infinity
