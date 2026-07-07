@@ -11,6 +11,7 @@ env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
   GATEWAY_PORT: 18789
+  PROXY_PORT: 19000
 
 jobs:
   queen:
@@ -19,30 +20,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Provision essential tools and binary stacks
-      - name: Install Queen Dependencies
+      # 1. Provision non-engine dependencies cleanly
+      - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl git nodejs npm jq netcat-openbsd
-          curl -fsSL https://ollama.com/install.sh | sh
           sudo npm install -g openclaw holesail
           
           # Fetch cloudflared binary directly
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # 2. Spin up base model weights runtime
-      - name: Start Ollama Engine
-        run: |
-          ollama serve &
-          sleep 5
-          ollama pull ${{ env.OLLAMA_MODEL }}
+      # 2. Automatically install Ollama, start the server, and download model weights
+      - name: Setup Ollama Engine
+        uses: aktech/setup-ollama@v5
+        with:
+          model: ${{ env.OLLAMA_MODEL }}
 
-      # 3. Launch OpenClaw natively using your exact working command
-      - name: Launch OpenClaw Gateway via Ollama
+      # 3. Provision workspace skills layout
+      - name: Setup Custom Agent Skills
         run: |
           mkdir -p ~/.openclaw/workspace/skills/run_worker
-          
           cat << 'EOF' > ~/.openclaw/workspace/skills/run_worker/SKILL.md
           # run_worker
           
@@ -55,9 +53,40 @@ jobs:
           ## Parameters
           - query (string): The precise task query to be executed by the worker.
           EOF
-
           chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
-          
+
+      # 4. Spin up NGINX to intercept traffic and strip dynamic CORS browser origins
+      - name: Setup NGINX Proxy Service
+        uses: nyurik/action-setup-nginx@v1
+        with:
+          port: ${{ env.PROXY_PORT }}
+          conf-file-text: |
+            events { worker_connections 1024; }
+            http {
+                server {
+                    listen 19000;
+                    
+                    location / {
+                        proxy_pass http://127.0.0.1:18789;
+                        
+                        # Strip dynamic proxy headers and feed local context to OpenClaw
+                        proxy_set_header Origin "http://127.0.0.1:18789";
+                        proxy_set_header Host "127.0.0.1:18789";
+                        
+                        # Maintain WebSocket handshake stability
+                        proxy_http_version 1.1;
+                        proxy_set_header Upgrade $http_upgrade;
+                        proxy_set_header Connection "Upgrade";
+                        
+                        proxy_read_timeout 86400s;
+                        proxy_send_timeout 86400s;
+                    }
+                }
+            }
+
+      # 5. Launch OpenClaw Gateway natively via Ollama wrapper toolchains
+      - name: Launch OpenClaw Gateway via Ollama
+        run: |
           nohup ollama launch openclaw --model ${{ env.OLLAMA_MODEL }} --yes > openclaw.log 2>&1 &
           
           echo "⏳ Waiting for OpenClaw Gateway to bind to port ${{ env.GATEWAY_PORT }}..."
@@ -70,15 +99,11 @@ jobs:
             sleep 3
           done
 
-      # 4. Bind public routing tunnel proxy AND inject host/origin header overrides
+      # 6. Bind Cloudflare Tunnel proxy targeting the NGINX input port instead
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
-          # ⚡ FIX: We add --http-header flags to make the tunnel impersonate local traffic, wiping out the CORS issue completely!
-          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.GATEWAY_PORT }} \
-            --http-header "Origin: http://127.0.0.1:${{ env.GATEWAY_PORT }}" \
-            --http-header "Host: 127.0.0.1:${{ env.GATEWAY_PORT }}" \
-            --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
+          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.PROXY_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
           for i in {1..20}; do
@@ -92,7 +117,7 @@ jobs:
           done
           sleep 5
 
-      # 5. Output link data and maintain connection live state
+      # 7. Output link data and maintain connection live state indefinitely
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           echo "================================================================="
@@ -100,9 +125,6 @@ jobs:
           echo "================================================================="
           echo ""
           echo "--- LOG DIAGNOSTICS (OpenClaw Output Preview) ---"
-          head -n 40 openclaw.log || true
-          echo ""
-          echo "--- LOG DIAGNOSTICS (Cloudflared Output Preview) ---"
-          head -n 20 tunnel.log || true
+          head -n 20 openclaw.log || true
           echo "================================================================="
           sleep infinity
