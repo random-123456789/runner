@@ -32,7 +32,7 @@ jobs:
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # 2. Setup Ollama runtime
+      # 2. Setup Ollama runtime environment
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
 
@@ -59,14 +59,15 @@ jobs:
           EOF
           chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
 
-      # 5. FIX: Boot down the python bypass routing layer from the updated scripts directory
+      # 5. Boot down the python bypass routing layer from the updated scripts directory
       - name: Start Python CORS Handshake Proxy
         run: |
           python3 scripts/cors_proxy.py &
           sleep 2
 
-      # 6. Launch OpenClaw core control instance
+      # 6. Launch OpenClaw Gateway and extract the dynamic security token
       - name: Launch OpenClaw Gateway via Ollama
+        id: openclaw_boot
         run: |
           nohup ollama launch openclaw --model ${{ env.OLLAMA_MODEL }} --yes > openclaw.log 2>&1 &
           
@@ -79,6 +80,18 @@ jobs:
             echo "Keep waiting... ($i/20)"
             sleep 3
           done
+          
+          # 🔐 Extract the dynamic token from initialization logs
+          echo "🔑 Parsing Gateway Security Access Credentials..."
+          TOKEN=$(grep -oP '(?:token=|Token:\s*)([a-zA-Z0-9_\.\-]+)' openclaw.log | head -1 | sed 's/token=//I' | sed 's/Token:\s*//I')
+          
+          if [ -n "$TOKEN" ]; then
+            echo "gateway_token=$TOKEN" >> $GITHUB_OUTPUT
+            echo "Successfully parsed token marker."
+          else
+            echo "gateway_token=none" >> $GITHUB_OUTPUT
+            echo "⚠️ Warning: No explicit token found. Gateway might be running wide open."
+          fi
 
       # 7. Fire up Cloudflare Tunnel pointing straight at the Python proxy interface
       - name: Start Cloudflare Tunnel Connection
@@ -98,11 +111,21 @@ jobs:
           done
           sleep 5
 
-      # 8. Output stable entry endpoint URL and maintain active runtime thread state
+      # 8. Output stable entry endpoint URL WITH Token Auth Query appended automatically
       - name: Print Orchestration Access Route & Keep Alive
         run: |
+          TOKEN_VAL="${{ steps.openclaw_boot.outputs.gateway_token }}"
+          BASE_URL="${{ steps.tunnel.outputs.tunnel_url }}"
+          
           echo "================================================================="
-          echo "🌐 OPENCLAW PORTAL ROUTE: ${{ steps.tunnel.outputs.tunnel_url }}"
+          if [ "$TOKEN_VAL" != "none" ] && [ -n "$TOKEN_VAL" ]; then
+            echo "🌐 AUTHENTICATED PORTAL ROUTE:"
+            echo "👉 ${BASE_URL}/?token=${TOKEN_VAL}"
+            echo ""
+            echo "🔑 RAW GATEWAY TOKEN: ${TOKEN_VAL}"
+          else
+            echo "🌐 OPENCLAW PORTAL ROUTE: ${BASE_URL}"
+          fi
           echo "================================================================="
           echo ""
           echo "--- LOG DIAGNOSTICS (OpenClaw Output Preview) ---"
