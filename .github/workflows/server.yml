@@ -36,51 +36,12 @@ jobs:
           sleep 5
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      - name: Configure OpenClaw File Architecture
+      - name: Launch OpenClaw Gateway via Ollama
         run: |
-          # 1. Generate core openclaw directory layout cleanly
-          mkdir -p ~/.openclaw
+          # Create custom skill workspace folder for your launcher script
           mkdir -p ~/.openclaw/workspace/skills/run_worker
           
-          # 2. Inject configuration layout with wildcard domain tracking for TryCloudflare
-          cat << 'EOF' > ~/.openclaw/openclaw.json
-          {
-            "gateway": {
-              "port": 18789,
-              "mode": "local",
-              "bind": "loopback",
-              "auth": {
-                "mode": "none"
-              },
-              "controlUi": {
-                "allowedOrigins": [
-                  "https://*.trycloudflare.com"
-                ]
-              }
-            },
-            "agents": {
-              "defaults": {
-                "model": "ollama/granite4:tiny-h"
-              }
-            },
-            "models": {
-              "providers": {
-                "ollama": {
-                  "baseUrl": "http://127.0.0.1:11434",
-                  "models": [
-                    { 
-                      "id": "granite4:tiny-h", 
-                      "name": "granite4:tiny-h",
-                      "api": "ollama" 
-                    }
-                  ]
-                }
-              }
-            }
-          }
-          EOF
-
-          # 3. Register your custom agent skill tool via markdown manifest natively
+          # Register your custom agent skill tool via markdown manifest natively
           cat << 'EOF' > ~/.openclaw/workspace/skills/run_worker/SKILL.md
           # run_worker
           
@@ -94,18 +55,16 @@ jobs:
           - query (string): The precise task query to be executed by the worker.
           EOF
 
-          # 4. Enforce execution permissions on your deployment script
+          # Enforce execution permissions on your deployment script
           chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
 
-      - name: Start Gateway Engine
-        run: |
-          # Launch OpenClaw first so the port is active before cloudflared hooks into it
-          nohup openclaw gateway start --allow-unconfigured > openclaw.log 2>&1 &
+          # Use official headless integration command to instantly provision & bind the gateway
+          nohup ollama launch openclaw --model ${{ env.OLLAMA_MODEL }} --yes > openclaw.log 2>&1 &
           
           echo "⏳ Waiting for OpenClaw Gateway to bind to port ${{ env.GATEWAY_PORT }}..."
           for i in {1..20}; do
             if curl -s http://127.0.0.1:${{ env.GATEWAY_PORT }} > /dev/null || [ $? -eq 52 ]; then
-              echo "✅ OpenClaw Gateway is officially online!"
+              echo "✅ OpenClaw Gateway successfully verified online!"
               break
             fi
             echo "Keep waiting... ($i/20)"
@@ -115,7 +74,7 @@ jobs:
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
-          # Route tunnel requests cleanly to loopback interface mapping now that OpenClaw is ready
+          # Route tunnel requests cleanly to loopback interface mapping
           nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.GATEWAY_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
@@ -135,11 +94,14 @@ jobs:
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           echo "================================================================="
-          echo "🌐 OPENCLAW SECURE PORTAL ROUTE:"
-          echo "   ${{ steps.tunnel.outputs.tunnel_url }}"
+          echo "🌐 OPENCLAW PORTAL ROUTE: ${{ steps.tunnel.outputs.tunnel_url }}"
           echo "================================================================="
           echo ""
-          echo "🔑 NO TOKEN REQUIRED"
+          echo "--- LOG DIAGNOSTICS (OpenClaw Output Preview) ---"
+          head -n 40 openclaw.log || true
+          echo ""
+          echo "--- LOG DIAGNOSTICS (Cloudflared Output Preview) ---"
+          head -n 20 tunnel.log || true
           echo "================================================================="
           
           # Hold runner pipeline open
