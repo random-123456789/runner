@@ -38,20 +38,24 @@ jobs:
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # 4. Clone and launch the official Hermes WebUI Server with inline runtime injection
+      # 4. Clone, configure, and launch the official Hermes WebUI Server
       - name: Deploy Hermes WebUI Workspace
         run: |
           git clone https://github.com/nesquena/hermes-webui.git hermes-ui-repo
           cd hermes-ui-repo
           
-          # 🔗 INLINE ENVIRONMENT OVERRIDES: Forces the underlying Hermes framework to bypass config.yaml 
-          # and bind straight to your local Ollama engine instance using its OpenAI-compatible layer.
-          export HERMES_INFERENCE_PROVIDER="custom"
-          export HERMES_MODEL="${{ env.OLLAMA_MODEL }}"
-          export OPENAI_BASE_URL="http://127.0.0.1:11434/v1"
-          export OPENAI_API_KEY="ollama"
+          # Install Hermes Agent CLI dependencies first so we can access the 'hermes' command line
+          pip install --user -r requirements.txt
           
-          # Run the official start script in the background to handle the environment boot sequence
+          # 🔗 HEADLESS CONFIGURATION: Run the native config engine to link directly 
+          # to your local Ollama setup without manual user prompt menus.
+          python3 -m hermes config set model.default "ollama/${{ env.OLLAMA_MODEL }}"
+          python3 -m hermes config set providers.ollama.base_url "http://127.0.0.1:11434"
+          
+          # Bypass the interactive web onboarding wizard since we've now manually tied the model
+          export HERMES_WEBUI_SKIP_ONBOARDING=1
+          
+          # Launch the background UI server cleanly
           nohup bash start.sh > ../hermes_ui.log 2>&1 &
           cd ..
           
