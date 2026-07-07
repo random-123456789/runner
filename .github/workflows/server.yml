@@ -19,16 +19,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Spin up Ollama Engine Natively on the runner for maximum GPU acceleration
+      # 1. Spin up Ollama Engine Natively on the runner for maximum hardware acceleration
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
 
-      # 2. Pull base model weights and automatically generate the 64K context variant
+      # 2. Pull base model weights and automatically extend context to 64K
       - name: Build 64K Context Agent Model Variant
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
           
-          # Injecting the extended memory parameter explicitly fixes the tool-calling runtime threshold
+          # Creating the Modelfile to match the 64,000 threshold required by Hermes tools
           echo "FROM ${{ env.OLLAMA_MODEL }}" > Modelfile
           echo "PARAMETER num_ctx 64000" >> Modelfile
           ollama create granite4-64k -f Modelfile
@@ -73,19 +73,23 @@ jobs:
       - name: Start Cloudflare Tunnel Container
         id: tunnel
         run: |
-          # By housing cloudflared inside the same docker subnet, the handshake maps 
-          # directly to 'hermes-dashboard', resolving standard CORS headers cleanly.
+          # Drop 'run' subcommand to explicitly trigger free Quick Tunnel allocations
           docker run -d \
             --name cloudflared-tunnel \
             --network hermes-net \
             cloudflare/cloudflared:latest \
-            tunnel --no-autoupdate run --url http://hermes-dashboard:${{ env.HERMES_DASHBOARD_PORT }}
+            tunnel --url http://hermes-dashboard:${{ env.HERMES_DASHBOARD_PORT }}
 
           echo "⏳ Catching dynamic public edge route URL..."
-          sleep 5
-          
-          URL=$(docker logs cloudflared-tunnel 2>&1 | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | head -1)
-          echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
+          # Active loop to reliably catch the ephemeral address from container logs
+          for i in {1..20}; do
+            URL=$(docker logs cloudflared-tunnel 2>&1 | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | head -1)
+            if [ -n "$URL" ]; then 
+              echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
+              break
+            fi
+            sleep 3
+          done
 
       # 6. Output direct URL access routes and sustain active keep-alive loop
       - name: Print Orchestration Access Route & Keep Alive
