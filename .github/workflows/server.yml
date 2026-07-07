@@ -11,7 +11,6 @@ env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
   GATEWAY_PORT: 18789
-  PROXY_PORT: 19000
 
 jobs:
   queen:
@@ -20,13 +19,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Update package managers and provision global node/python components
+      # 1. Update package managers and provision system tools
       - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl git nodejs npm jq netcat-openbsd python3-pip
+          sudo apt-get install -y curl git nodejs npm jq netcat-openbsd
           sudo npm install -g openclaw holesail
-          pip install websockets
           
           # Fetch cloudflared binary directly
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -59,13 +57,7 @@ jobs:
           EOF
           chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
 
-      # 5. Boot down the python bypass routing layer from the updated scripts directory
-      - name: Start Python CORS Handshake Proxy
-        run: |
-          python3 scripts/cors_proxy.py &
-          sleep 2
-
-      # 6. Launch OpenClaw Gateway and extract the dynamic security token
+      # 5. Launch OpenClaw Gateway and extract the dynamic security token
       - name: Launch OpenClaw Gateway via Ollama
         id: openclaw_boot
         run: |
@@ -93,11 +85,11 @@ jobs:
             echo "⚠️ Warning: No explicit token found. Gateway might be running wide open."
           fi
 
-      # 7. Fire up Cloudflare Tunnel pointing straight at the Python proxy interface
+      # 6. Fire up Cloudflare Tunnel pointing straight at the OpenClaw native gateway port
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
-          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.PROXY_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
+          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.GATEWAY_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
           for i in {1..20}; do
@@ -111,7 +103,7 @@ jobs:
           done
           sleep 5
 
-      # 8. Output stable entry endpoint URL WITH Token Auth Query appended automatically
+      # 7. Output stable entry endpoint URL with Token Auth Query appended automatically
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           TOKEN_VAL="${{ steps.openclaw_boot.outputs.gateway_token }}"
