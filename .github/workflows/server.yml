@@ -1,105 +1,169 @@
 name: Queen Orchestrator
-
 on:
   workflow_dispatch:
-
 permissions:
   contents: write
   actions: write
-
 env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
-  HERMES_DASHBOARD_PORT: 9119
-
+  HERMES_FRONTEND_PORT: 9119
+  HERMES_BACKEND_PORT: 9120
+  HERMES_PUBLIC_PORT: 8888
 jobs:
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
-
-      # 1. Spin up Ollama Engine Natively on the runner for maximum hardware acceleration
+      
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y curl python3-pip python3-venv netcat-openbsd nginx
+          curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
-
-      # 2. Pull base model weights and automatically extend context to 64K
-      - name: Build 64K Context Agent Model Variant
-        run: |
-          ollama pull ${{ env.OLLAMA_MODEL }}
+        
+      - name: Pull Ollama Model Weights
+        run: ollama pull ${{ env.OLLAMA_MODEL }}
           
-          # Creating the Modelfile to match the 64,000 threshold required by Hermes tools
-          echo "FROM ${{ env.OLLAMA_MODEL }}" > Modelfile
-          echo "PARAMETER num_ctx 64000" >> Modelfile
-          ollama create granite4-64k -f Modelfile
-          
-          echo "✅ Custom 64K Context Model Variant successfully registered:"
-          ollama list
-
-      # 3. Provision isolated bridge infrastructure
-      - name: Create Isolated Container Network
+      - name: Verify Ollama is Ready
         run: |
-          docker network create hermes-net
-
-      # 4. Spin up Hermes Server and Dashboard Components inside an isolated environment
-      - name: Launch Hermes Container
-        run: |
-          docker run -d \
-            --name hermes-dashboard \
-            --network hermes-net \
-            -p ${{ env.HERMES_DASHBOARD_PORT }}:${{ env.HERMES_DASHBOARD_PORT }} \
-            -e HERMES_ALLOWED_ORIGINS="*" \
-            -e HERMES_ALLOWED_HOSTS="*" \
-            -e HERMES_DISABLE_CSRF="true" \
-            -e HERMES_INSECURE="true" \
-            -v ~/.hermes:/root/.hermes \
-            python:3.11-slim /bin/bash -c "
-              pip install --upgrade pip && \
-              pip install 'hermes-agent[web,pty]' && \
-              mkdir -p /root/.hermes && \
-              echo 'provider: \"ollama\"' > /root/.hermes/config.yaml && \
-              echo 'model: \"granite4-64k\"' >> /root/.hermes/config.yaml && \
-              echo 'providers:' >> /root/.hermes/config.yaml && \
-              echo '  ollama:' >> /root/.hermes/config.yaml && \
-              echo '    base_url: \"http://host.docker.internal:11434\"' >> /root/.hermes/config.yaml && \
-              
-              echo '🚀 Starting Local Backend Core Engine...' && \
-              hermes serve --host 0.0.0.0 --port ${{ env.HERMES_DASHBOARD_PORT }}
-            "
-
-          echo "⏳ Waiting for containerized application boot sequence..."
-          sleep 15
-          docker logs hermes-dashboard
-
-      # 5. Direct the Cloudflare Tunnel client with optimal reverse proxy settings
-      - name: Start Cloudflare Tunnel Container
-        run: |
-          docker run -d \
-            --name cloudflared-tunnel \
-            --network hermes-net \
-            cloudflare/cloudflared:latest \
-            tunnel \
-            --url http://hermes-dashboard:${{ env.HERMES_DASHBOARD_PORT }} \
-            --http-host-header "hermes-dashboard:${{ env.HERMES_DASHBOARD_PORT }}" \
-            --no-tls-verify
-
-          echo "⏳ Catching dynamic public edge route URL..."
-          # Active loop to reliably catch the ephemeral address from container logs
-          for i in {1..20}; do
-            URL=$(docker logs cloudflared-tunnel 2>&1 | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | head -1)
-            if [ -n "$URL" ]; then 
-              echo "TUNNEL_URL=$URL" >> $GITHUB_ENV
-              echo "✅ URL Captured: $URL"
+          echo "⏳ Waiting for Ollama API..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 11434; then
+              echo "✅ Ollama is online!"
               break
             fi
-            sleep 3
+            sleep 2
           done
 
-      # 6. Output direct URL access routes and sustain active keep-alive loop
+      - name: Install Official Hermes Agent
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install "hermes-agent[web,pty]"
+          
+      - name: Pre-configure Hermes Runtime Environment
+        run: |
+          mkdir -p ~/.hermes
+          cat << 'EOF' > ~/.hermes/config.yaml
+          provider: "ollama"
+          model: "granite4:tiny-h"
+          providers:
+            ollama:
+              base_url: "http://127.0.0.1:11434"
+          EOF
+          
+      # ADDED CORS VARIABLES TO THE BACKEND TO PREVENT INFINITE RELOAD
+      - name: Start Hermes Backend Server
+        env:
+          HERMES_ALLOWED_ORIGINS: "*"
+          HERMES_ALLOWED_HOSTS: "*"
+          HERMES_DISABLE_CSRF: "true"
+          HERMES_INSECURE: "true"
+        run: |
+          echo "🚀 Starting Hermes backend API server..."
+          nohup hermes serve --host 127.0.0.1 --port ${{ env.HERMES_BACKEND_PORT }} > hermes_backend.log 2>&1 &
+          
+          echo "⏳ Waiting for backend to bind..."
+          for i in {1..15}; do
+            if nc -z 127.0.0.1 ${{ env.HERMES_BACKEND_PORT }}; then
+              echo "✅ Backend API is online!"
+              break
+            fi
+            sleep 2
+          done
+          
+      - name: Start Hermes Dashboard Frontend
+        env:
+          HERMES_ALLOWED_ORIGINS: "*"
+          HERMES_ALLOWED_HOSTS: "*"
+          HERMES_DISABLE_CSRF: "true"
+          HERMES_INSECURE: "true"
+        run: |
+          echo "🚀 Starting Hermes frontend dashboard..."
+          nohup hermes dashboard \
+            --host 127.0.0.1 \
+            --port ${{ env.HERMES_FRONTEND_PORT }} \
+            --no-open \
+            --skip-build > hermes_dashboard.log 2>&1 &
+          
+          echo "⏳ Waiting for frontend to bind..."
+          for i in {1..15}; do
+            if nc -z 127.0.0.1 ${{ env.HERMES_FRONTEND_PORT }}; then
+              echo "✅ Frontend is online!"
+              break
+            fi
+            sleep 2
+          done
+
+      # SIMPLIFIED & ENHANCED NGINX CONFIG
+      - name: Configure Nginx Reverse Proxy
+        run: |
+          sudo tee /etc/nginx/sites-available/hermes > /dev/null <<'EOF'
+          server {
+              listen 8888;
+
+              # 1. MAGIC WEBSOCKET CATCH-ALL: 
+              # If the browser asks for a WebSocket, force it to the backend, no matter the path!
+              if ($http_upgrade = "websocket") {
+                  proxy_pass http://127.0.0.1:9120;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_set_header Host 127.0.0.1:9120;
+                  proxy_set_header Origin $http_origin;
+                  break;
+              }
+
+              # 2. API calls go to Backend
+              location /api {
+                  proxy_pass http://127.0.0.1:9120;
+                  proxy_set_header Host 127.0.0.1:9120;
+                  proxy_set_header Origin $http_origin;
+              }
+
+              # 3. Everything else (HTML, JS, CSS) goes to Frontend
+              location / {
+                  proxy_pass http://127.0.0.1:9119;
+                  proxy_set_header Host 127.0.0.1:9119;
+              }
+          }
+          EOF
+          
+          sudo ln -sf /etc/nginx/sites-available/hermes /etc/nginx/sites-enabled/
+          sudo rm -f /etc/nginx/sites-enabled/default
+          sudo nginx -t && sudo systemctl restart nginx
+          echo "✅ Nginx proxy is online!"
+          
+      - name: Start Cloudflare Tunnel Connection
+        id: tunnel
+        # REMOVED --http-host-header so Nginx can manage headers cleanly
+        run: |
+          nohup ./cloudflared tunnel \
+            --url http://127.0.0.1:${{ env.HERMES_PUBLIC_PORT }} > tunnel.log 2>&1 &
+          
+          sleep 2
+          
+          echo "⏳ Catching TryCloudflare edge address registration..."
+          for i in {1..20}; do
+            URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            if [ -n "$URL" ]; then 
+              echo "✅ Tunnel successfully established!"
+              echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
+              break
+            fi
+            echo "Waiting for Cloudflare edge... (Attempt $i/20)" 
+            sleep 3
+          done
+          
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           echo "================================================================="
           echo "🌐 OFFICIAL HERMES CONTROL PLANE PORTAL READY:"
-          echo "👉 ${{ env.TUNNEL_URL }}"
+          echo "👉 ${{ steps.tunnel.outputs.tunnel_url }}"
           echo "================================================================="
           sleep infinity
