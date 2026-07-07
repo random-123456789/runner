@@ -1,49 +1,56 @@
 name: Queen Orchestrator
-
 on:
   workflow_dispatch:
-
 permissions:
   contents: write
   actions: write
-
 env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
   HERMES_DASHBOARD_PORT: 9119
-
 jobs:
   queen:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
-
+      
       # 1. Provision foundational dependencies and download cloudflared
       - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl python3-pip python3-venv netcat-openbsd openssh-server
-          
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
-
+          
       # 2. Setup Ollama runtime engine
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
-
+        
       # 3. Pull required weight files natively
       - name: Pull Ollama Model Weights
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
+          
+      # 4. CRITICAL: Wait for Ollama to be fully ready before starting Hermes
+      - name: Verify Ollama is Ready
+        run: |
+          echo "⏳ Waiting for Ollama API to be ready..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 11434; then
+              echo "✅ Ollama is online!"
+              break
+            fi
+            sleep 2
+          done
 
-      # 4. Install official hermes-agent with core web extensions
+      # 5. Install official hermes-agent with core web extensions
       - name: Install Official Hermes Agent
         run: |
           python3 -m pip install --upgrade pip
           pip install "hermes-agent[web,pty]"
-
-      # 5. Pre-seed local engine runtime parameters
+          
+      # 6. Pre-seed local engine runtime parameters (FIXED INDENTATION)
       - name: Pre-configure Hermes Runtime Environment
         run: |
           mkdir -p ~/.hermes
@@ -54,8 +61,8 @@ jobs:
             ollama:
               base_url: "http://127.0.0.1:11434"
           EOF
-
-      # 6. Initialize local server instances with global execution variables
+          
+      # 7. Initialize local server instances
       - name: Start Hermes Native Dashboard
         env:
           HERMES_ALLOWED_ORIGINS: "*"
@@ -77,16 +84,13 @@ jobs:
             fi
             sleep 3
           done
-
-      # 7. Bridge connection channels via clean local forwarding parameters
+          
+      # 8. Bridge connection channels (FIXED LOCALHOST CONFLICT & REMOVED HOST HEADER HACK)
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
-          # Use an internal mapping proxy loop to reconcile the browser origin mismatch
           nohup ./cloudflared tunnel \
-            --url http://localhost:${{ env.HERMES_DASHBOARD_PORT }} \
-            --http-host-header "localhost:${{ env.HERMES_DASHBOARD_PORT }}" \
-            --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
+            --url http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
           for i in {1..20}; do
@@ -98,15 +102,15 @@ jobs:
             sleep 3
           done
           sleep 5
-
-      # 8. Print terminal dashboard logs for active auditing
+          
+      # 9. Print terminal dashboard logs for active auditing
       - name: Print Active Hermes Process Logs
         run: |
           echo "=== STARTING LOG DUMP ==="
           cat hermes_dashboard.log || true
           echo "========================="
-
-      # 9. Output URL entrypoint routes and hold the runtime window open
+          
+      # 10. Output URL entrypoint routes and hold the runtime window open
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           echo "================================================================="
