@@ -10,7 +10,6 @@ permissions:
 env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
-  HERMES_PORT: 11434
   PROXY_PORT: 19000
 
 jobs:
@@ -20,49 +19,52 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Update package managers and provision system binaries
+      # 1. Pull core engine applications and runtime frameworks
       - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl git nodejs npm jq netcat-openbsd python3-pip
+          sudo apt-get install -y curl git python3-pip netcat-openbsd
           pip install websockets
           
-          # Pull down the cloudflared edge routing daemon
+          # Fetch cloudflared binary directly
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # 2. Setup Ollama server runtime
+      # 2. Setup Ollama Server Environment
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
 
-      # 3. Pull required Granite weight models natively
+      # 3. Cache and provision model weight structures
       - name: Pull Ollama Model Weights
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # 4. Boot up the local Python Proxy Layer
+      # 4. Spin up the underlying Python Header Stripper Proxy
       - name: Start Python CORS Handshake Proxy
         run: |
           python3 scripts/cors_proxy.py &
           sleep 2
 
-      # 5. Launch Hermes Web UI and Agent Core natively
-      - name: Launch Hermes Agent Workspace
+      # 5. Spin up Open WebUI container mapped directly to host ports
+      - name: Deploy Open WebUI Panel
         run: |
-          # Spin up the native web environment using the pulled model weights
-          nohup ollama launch hermes --model ${{ env.OLLAMA_MODEL }} --yes > hermes.log 2>&1 &
+          docker run -d -p 3000:8080 \
+            --add-host=host.docker.internal:host-gateway \
+            -v open-webui:/app/backend/data \
+            --name open-webui \
+            --restart always \
+            ghcr.io/open-webui/open-webui:main
           
-          echo "⏳ Waiting for Hermes Web UI to bind..."
-          for i in {1..20}; do
-            if curl -s http://127.0.0.1:${{ env.HERMES_PORT }} > /dev/null || [ $? -eq 52 ]; then
-              echo "✅ Hermes Web Interface is online!"
+          echo "⏳ Waiting for Web UI container space to wake up..."
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:3000 > /dev/null; then
+              echo "✅ Interface Dashboard fully online and bound!"
               break
             fi
-            echo "Keep waiting... ($i/20)"
             sleep 3
           done
 
-      # 6. Connect Cloudflare Tunnel to the Python Proxy instead of directly to Hermes
+      # 6. Establish secure edge connection over Cloudflare
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
@@ -80,17 +82,17 @@ jobs:
           done
           sleep 5
 
-      # 7. Print public entry URL and hold job execution alive
+      # 7. Print stable entry point and preserve runtime threads
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           BASE_URL="${{ steps.tunnel.outputs.tunnel_url }}"
           
           echo "================================================================="
-          echo "🌐 HERMES PROXIED INTERFACE PORTAL READY:"
+          echo "🌐 INTERACTIVE WORKSPACE INTERFACE PORTAL READY:"
           echo "👉 ${BASE_URL}"
           echo "================================================================="
           echo ""
-          echo "--- LOG DIAGNOSTICS (Hermes Initialization Preview) ---"
-          head -n 25 hermes.log || true
+          echo "--- CONTAINER RUNTIME STATUS ---"
+          docker ps || true
           echo "================================================================="
           sleep infinity
