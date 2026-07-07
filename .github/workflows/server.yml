@@ -29,9 +29,9 @@ jobs:
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
           
-      - name: Verify Ollama is Ready
+      - name: Verify Ollama is Ready & Model Works
         run: |
-          echo "⏳ Waiting for Ollama API to be ready..."
+          echo "⏳ Waiting for Ollama API..."
           for i in {1..30}; do
             if nc -z 127.0.0.1 11434; then
               echo "✅ Ollama is online!"
@@ -39,6 +39,10 @@ jobs:
             fi
             sleep 2
           done
+          
+          # CRITICAL: Actually test if the model can generate text
+          echo "🧠 Testing model inference..."
+          ollama run ${{ env.OLLAMA_MODEL }} "Say hello" 2>&1 | head -5
 
       - name: Install Official Hermes Agent
         run: |
@@ -56,6 +60,13 @@ jobs:
               base_url: "http://127.0.0.1:11434"
           EOF
           
+      - name: Diagnose Hermes Backend Startup
+        run: |
+          echo "🔍 Running Hermes in foreground for 5 seconds to catch errors..."
+          timeout 5s hermes dashboard --host 127.0.0.1 --port ${{ env.HERMES_DASHBOARD_PORT }} --no-open --skip-build 2>&1 || true
+          echo "================================================="
+          echo "If there is a Python traceback above, that is why the Gateway is Off."
+          
       - name: Start Hermes Native Dashboard
         env:
           HERMES_ALLOWED_ORIGINS: "*"
@@ -69,7 +80,7 @@ jobs:
             --no-open \
             --skip-build > hermes_dashboard.log 2>&1 &
           
-          echo "⏳ Waiting for dashboard to bind to 127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }}..."
+          echo "⏳ Waiting for dashboard to bind..."
           for i in {1..30}; do
             if nc -z 127.0.0.1 ${{ env.HERMES_DASHBOARD_PORT }}; then
               echo "✅ Dashboard is online!"
@@ -85,7 +96,6 @@ jobs:
             --url http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} \
             --http-host-header "127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }}" > tunnel.log 2>&1 &
           
-          # Give cloudflared 2 seconds to start its engine
           sleep 2
           
           echo "⏳ Catching TryCloudflare edge address registration..."
@@ -96,22 +106,9 @@ jobs:
               echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
               break
             fi
-            # This echo forces the GitHub UI to update in real-time so it doesn't look stuck
             echo "Waiting for Cloudflare edge... (Attempt $i/20)" 
             sleep 3
           done
-          
-          # If the loop finishes and we still don't have a URL, print the error log
-          if [ -z "$URL" ]; then
-            echo "❌ Failed to get Cloudflare URL. Printing tunnel.log:"
-            cat tunnel.log
-          fi
-          
-      - name: Print Active Hermes Process Logs
-        run: |
-          echo "=== HERMES LOGS ==="
-          cat hermes_dashboard.log || true
-          echo "==================="
           
       - name: Print Orchestration Access Route & Keep Alive
         run: |
