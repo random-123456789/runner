@@ -32,7 +32,6 @@ jobs:
 
       - name: Start Hermes Native Dashboard
         env:
-          # Pin a consistent session token to prevent disconnects
           HERMES_DASHBOARD_SESSION_TOKEN: "generate-a-strong-random-key-here"
         run: |
           mkdir -p ~/.hermes
@@ -44,7 +43,7 @@ jobs:
               base_url: "http://127.0.0.1:11434"
           EOF
           
-          # Added --host 0.0.0.0, --insecure, and --tui
+          # Start Dashboard
           nohup hermes dashboard \
             --host 0.0.0.0 \
             --port ${{ env.HERMES_DASHBOARD_PORT }} \
@@ -53,27 +52,27 @@ jobs:
             --no-open \
             --skip-build > hermes_dashboard.log 2>&1 &
           
+          # Improved readiness check
           echo "Waiting for dashboard to be responsive..."
-          for i in {1..20}; do
-            if curl -s http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} > /dev/null; then
-              echo "Dashboard is up!"
+          for i in {1..30}; do
+            # Use curl to verify the port is actually serving HTTP, not just open
+            if curl -s --max-time 2 http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} > /dev/null; then
+              echo "Dashboard is ready!"
               break
             fi
-            echo "Waiting for dashboard... ($i/10)"
-            sleep 3
+            echo "Waiting for dashboard... ($i/30)"
+            sleep 5
           done
 
       - name: Start Cloudflare Tunnel
         id: tunnel
         run: |
-          # We use --http-host-header to make the Dashboard "think" 
-          # the request is originating from 127.0.0.1
+          # Start Tunnel without complex host header overrides
           nohup ./cloudflared tunnel \
             --url http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} \
-            --http-host-header 127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} \
             > tunnel.log 2>&1 &
           
-          # URL Capture
+          # Capture URL
           for i in {1..20}; do
             URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$URL" ]; then 
@@ -89,3 +88,11 @@ jobs:
           echo "🌐 HERMES PORTAL READY: ${{ steps.tunnel.outputs.tunnel_url }}"
           echo "========================================================="
           sleep infinity
+
+      - name: Debug Logs
+        if: always()
+        run: |
+          echo "--- Hermes Dashboard Logs (tail) ---"
+          tail -n 20 hermes_dashboard.log
+          echo "--- Tunnel Logs (tail) ---"
+          tail -n 20 tunnel.log
