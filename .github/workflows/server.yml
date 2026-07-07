@@ -69,9 +69,6 @@ jobs:
               "bind": "loopback",
               "auth": {
                 "mode": "none"
-              },
-              "controlUi": {
-                "allowedOrigins": ["http://localhost:18789", "http://127.0.0.1:18789"]
               }
             },
             "agents": {
@@ -96,7 +93,10 @@ jobs:
           }
           EOF
 
-          # Boot up the openclaw gateway engine first to open port 18789 completely
+          # Completely disable origin checking via the official emergency environment flag
+          export OPENCLAW_GATEWAY_CONTROL_UI_DISABLE_ORIGIN_CHECK="true"
+
+          # Boot up the openclaw gateway engine
           nohup openclaw gateway start --allow-unconfigured > openclaw.log 2>&1 &
           
           echo "⏳ Verifying control gateway boot sequence..."
@@ -108,40 +108,37 @@ jobs:
             sleep 3
           done
 
-      - name: Start Cloudflare Tunnel and Inject Live Origin
+      - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
-          # Fire up cloudflared now that the port is definitively awake
-          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.GATEWAY_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
+          # Force IPv4 connection to the loopback interface using explicit IP routing flags
+          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.GATEWAY_PORT }} --http-host-header "127.0.0.1:${{ env.GATEWAY_PORT }}" --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
-          TUNNEL_URL=""
           for i in {1..20}; do
-            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$TUNNEL_URL" ]; then 
-              echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
-              echo "Found address: $TUNNEL_URL"
+            URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            if [ -n "$URL" ]; then 
+              echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
+              echo "Found address: $URL"
               break
             fi
             sleep 3
           done
           
-          # Inject the dynamic origin using runtime parameter adjustment via local API endpoint
-          echo "Updating runtime allowlist configuration context..."
-          curl -s -X POST http://127.0.0.1:${{ env.GATEWAY_PORT }}/api/config/origins \
-            -H "Content-Type: application/json" \
-            -d "{\"origin\":\"$TUNNEL_URL\"}" || true
-          
+          # Allow edge propagation buffer time before link interaction
           sleep 5
 
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           echo "================================================================="
-          echo "🌐 OPENCLAW SECURE PORTAL ROUTE:"
-          echo "   ${{ steps.tunnel.outputs.tunnel_url }}"
+          echo "🌐 OPENCLAW PORTAL ROUTE: ${{ steps.tunnel.outputs.tunnel_url }}"
           echo "================================================================="
           echo ""
-          echo "🔑 LIVE SYNC SUCCESSFUL (No token required)"
+          echo "--- LOG DIAGNOSTICS (OpenClaw Output Preview) ---"
+          head -n 20 openclaw.log || true
+          echo ""
+          echo "--- LOG DIAGNOSTICS (Cloudflared Output Preview) ---"
+          head -n 20 tunnel.log || true
           echo "================================================================="
           
           # Hold runner pipeline open
