@@ -10,7 +10,7 @@ permissions:
 env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
-  HERMES_PORT: 8642  # Standard native port used by the Hermes headless core engine
+  HERMES_UI_PORT: 8787  # Native default port for nesquena/hermes-webui
 
 jobs:
   queen:
@@ -38,33 +38,37 @@ jobs:
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # 4. Bootstrap the native Hermes Core Service pointing directly to Ollama
-      - name: Launch Headless Hermes Core Engine
+      # 4. Clone and launch the official Hermes WebUI Server with inline runtime injection
+      - name: Deploy Hermes WebUI Workspace
         run: |
-          # Install the latest official hermes-cli engine binary globally
-          npm install -g @open-claw/hermes-cli || pip install hermes-cli || true
+          git clone https://github.com/nesquena/hermes-webui.git hermes-ui-repo
+          cd hermes-ui-repo
           
-          # Force environment settings to pick up your running Ollama engine configuration
-          export OLLAMA_HOST="http://127.0.0.1:11434"
-          export HERMES_DEFAULT_MODEL="${{ env.OLLAMA_MODEL }}"
+          # 🔗 INLINE ENVIRONMENT OVERRIDES: Forces the underlying Hermes framework to bypass config.yaml 
+          # and bind straight to your local Ollama engine instance using its OpenAI-compatible layer.
+          export HERMES_INFERENCE_PROVIDER="custom"
+          export HERMES_MODEL="${{ env.OLLAMA_MODEL }}"
+          export OPENAI_BASE_URL="http://127.0.0.1:11434/v1"
+          export OPENAI_API_KEY="ollama"
           
-          # Spin up the headless backend daemon on port 8642
-          nohup hermes serve --port ${{ env.HERMES_PORT }} > ../hermes_core.log 2>&1 &
+          # Run the official start script in the background to handle the environment boot sequence
+          nohup bash start.sh > ../hermes_ui.log 2>&1 &
+          cd ..
           
-          echo "⏳ Waiting for Hermes Core service to bind to port ${{ env.HERMES_PORT }}..."
+          echo "⏳ Waiting for Hermes WebUI server to bind to port ${{ env.HERMES_UI_PORT }}..."
           for i in {1..30}; do
-            if nc -z 127.0.0.1 ${{ env.HERMES_PORT }}; then
-              echo "✅ Hermes Core Integration successfully verified online!"
+            if curl -s http://127.0.0.1:${{ env.HERMES_UI_PORT }} > /dev/null || [ $? -eq 52 ]; then
+              echo "✅ Hermes Community WebUI successfully verified online!"
               break
             fi
             sleep 3
           done
 
-      # 5. Connect Cloudflare Tunnel straight to the native Hermes Core Port
+      # 5. Connect Cloudflare Tunnel straight to the native Hermes UI port (8787)
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
-          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.HERMES_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
+          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.HERMES_UI_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
           for i in {1..20}; do
@@ -84,11 +88,11 @@ jobs:
           BASE_URL="${{ steps.tunnel.outputs.tunnel_url }}"
           
           echo "================================================================="
-          echo "🌐 HEADLESS HERMES CORE PROVIDER LINKED NATIVELY TO OLLAMA:"
+          echo "🌐 OFFICIAL HERMES WEBUI PORTAL READY:"
           echo "👉 ${BASE_URL}"
           echo "================================================================="
           echo ""
-          echo "--- CORE LOG DIAGNOSTICS (Runtime Setup Output) ---"
-          head -n 25 hermes_core.log || true
+          echo "--- DASHBOARD STATUS (Previewing WebUI Workspace Boot Log) ---"
+          head -n 25 hermes_ui.log || true
           echo "================================================================="
           sleep infinity
