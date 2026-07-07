@@ -31,42 +31,43 @@ jobs:
       - run: ollama pull ${{ env.OLLAMA_MODEL }}
 
       - name: Start Hermes Native Dashboard
-        # Setting ALLOWED_ORIGINS to '*' bypasses the browser-side WebSocket security gate
         env:
-          HERMES_ALLOWED_ORIGINS: "*"
+          HERMES_DASHBOARD_SESSION_TOKEN: "your-random-secure-key"
         run: |
           mkdir -p ~/.hermes
           cat << 'EOF' > ~/.hermes/config.yaml
           provider: "ollama"
-          model: "granite4:tiny-h"
+          model: "${{ env.OLLAMA_MODEL }}"
           providers:
             ollama:
               base_url: "http://127.0.0.1:11434"
           EOF
           
+          # Start dashboard in the background
           nohup hermes dashboard \
             --host 0.0.0.0 \
+            --port ${{ env.HERMES_DASHBOARD_PORT }} \
+            --insecure \
+            --tui \
             --no-open \
-            --skip-build \
-            --port ${{ env.HERMES_DASHBOARD_PORT }} > hermes_dashboard.log 2>&1 &
+            --skip-build > hermes_dashboard.log 2>&1 &
           
-          # Health check: Wait for port to open
-          for i in {1..20}; do
-            if nc -z 127.0.0.1 ${{ env.HERMES_DASHBOARD_PORT }}; then break; fi
-            sleep 3
+          # Readiness Probe: Ensure dashboard is alive
+          echo "Waiting for dashboard to be responsive..."
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} > /dev/null; then
+              echo "Dashboard is up!"
+              break
+            fi
+            sleep 5
           done
 
       - name: Start Cloudflare Tunnel
         id: tunnel
         run: |
-          # We use --http-host-header to make the Dashboard "think" 
-          # the request is originating from 127.0.0.1
-          nohup ./cloudflared tunnel \
-            --url http://0.0.0.0:${{ env.HERMES_DASHBOARD_PORT }} \
-            --http-host-header 0.0.0.0:${{ env.HERMES_DASHBOARD_PORT }} \
-            > tunnel.log 2>&1 &
+          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} > tunnel.log 2>&1 &
           
-          # URL Capture
+          # Capture URL
           for i in {1..20}; do
             URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$URL" ]; then 
@@ -78,7 +79,5 @@ jobs:
 
       - name: Access Route
         run: |
-          echo "========================================================="
           echo "🌐 HERMES PORTAL READY: ${{ steps.tunnel.outputs.tunnel_url }}"
-          echo "========================================================="
           sleep infinity
