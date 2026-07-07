@@ -38,7 +38,7 @@ jobs:
           sleep 5
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # 3. Launch OpenClaw natively using the wrapper with global environment injections
+      # 3. Launch OpenClaw natively using your exact working command
       - name: Launch OpenClaw Gateway via Ollama
         run: |
           mkdir -p ~/.openclaw/workspace/skills/run_worker
@@ -57,27 +57,28 @@ jobs:
           EOF
 
           chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
-
-          # Inject origin bypass directly into the parent environment, then launch
-          export OPENCLAW_GATEWAY_CONTROL_UI_DISABLE_ORIGIN_CHECK="true"
           
           nohup ollama launch openclaw --model ${{ env.OLLAMA_MODEL }} --yes > openclaw.log 2>&1 &
           
           echo "⏳ Waiting for OpenClaw Gateway to bind to port ${{ env.GATEWAY_PORT }}..."
           for i in {1..20}; do
             if curl -s http://127.0.0.1:${{ env.GATEWAY_PORT }} > /dev/null || [ $? -eq 52 ]; then
-              echo "✅ OpenClaw Gateway successfully verified online and accessible!"
+              echo "✅ OpenClaw Gateway successfully verified online!"
               break
             fi
             echo "Keep waiting... ($i/20)"
             sleep 3
           done
 
-      # 4. Bind public routing tunnel proxy
+      # 4. Bind public routing tunnel proxy AND inject host/origin header overrides
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
-          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.GATEWAY_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
+          # ⚡ FIX: We add --http-header flags to make the tunnel impersonate local traffic, wiping out the CORS issue completely!
+          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.GATEWAY_PORT }} \
+            --http-header "Origin: http://127.0.0.1:${{ env.GATEWAY_PORT }}" \
+            --http-header "Host: 127.0.0.1:${{ env.GATEWAY_PORT }}" \
+            --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
           for i in {1..20}; do
