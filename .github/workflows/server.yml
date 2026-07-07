@@ -73,7 +73,7 @@ jobs:
             "gateway": {
               "port": 18789,
               "mode": "local",
-              "bind": "0.0.0.0",
+              "bind": "auto",
               "auth": {
                 "mode": "none"
               }
@@ -100,19 +100,16 @@ jobs:
           }
           EOF
 
-          # Turn off cross-origin check flags
           export OPENCLAW_GATEWAY_CONTROL_UI_DISABLE_ORIGIN_CHECK="true"
-          
           nohup openclaw gateway start > openclaw.log 2>&1 &
           
-          echo "⏳ Running verification loop on all interfaces..."
+          echo "⏳ Running verification loop on auto-bind layout..."
           for i in {1..25}; do
-            # Netcat verification to watch port 18789 binding successfully
             if nc -z 127.0.0.1 ${{ env.GATEWAY_PORT }}; then
-              echo "✅ OpenClaw verified active and listening globally!"
+              echo "✅ OpenClaw configuration validated and gateway is listening!"
               break
             fi
-            echo "Waiting for process interface assignment... ($i/25)"
+            echo "Waiting for process to come online... ($i/25)"
             sleep 3
           done
           
