@@ -10,7 +10,7 @@ permissions:
 env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
-  HERMES_UI_PORT: 8787  # Native default port for nesquena/hermes-webui
+  HERMES_DASHBOARD_PORT: 9119  # Default official native port for hermes dashboard
 
 jobs:
   queen:
@@ -19,17 +19,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Update package managers and provision system environment binaries
+      # 1. Provision system binaries and download cloudflared
       - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl git python3-pip netcat-openbsd
+          sudo apt-get install -y curl python3-pip python3-venv netcat-openbsd
           
-          # Fetch cloudflared binary directly for external connection routes
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # 2. Setup Ollama runtime environment
+      # 2. Setup Ollama runtime engine
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
 
@@ -38,41 +37,49 @@ jobs:
         run: |
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # 4. Clone, configure, and launch the official Hermes WebUI Server
-      - name: Deploy Hermes WebUI Workspace
+      # 4. Install the official Nous Research Hermes Agent package with Web extensions
+      - name: Install Official Hermes Agent
         run: |
-          git clone https://github.com/nesquena/hermes-webui.git hermes-ui-repo
-          cd hermes-ui-repo
+          python3 -m pip install --upgrade pip
+          # Install the explicit web and pseudo-terminal dependencies for the dashboard layout
+          pip install "hermes-agent[web,pty]"
+
+      # 5. Pre-seed the official workspace configuration parameters
+      - name: Pre-configure Hermes Runtime Environment
+        run: |
+          mkdir -p ~/.hermes
           
-          # Install Hermes Agent CLI dependencies first so we can access the 'hermes' command line
-          pip install --user -r requirements.txt
+          # Write the official layout configuration file targeting your local Ollama engine
+          cat << 'EOF' > ~/.hermes/config.yaml
+          provider: "ollama"
+          model: "granite4:tiny-h"
+          providers:
+            ollama:
+              base_url: "http://127.0.0.1:11434"
+          EOF
           
-          # 🔗 HEADLESS CONFIGURATION: Run the native config engine to link directly 
-          # to your local Ollama setup without manual user prompt menus.
-          python3 -m hermes config set model.default "ollama/${{ env.OLLAMA_MODEL }}"
-          python3 -m hermes config set providers.ollama.base_url "http://127.0.0.1:11434"
+          echo "✅ Official config space pre-seeded successfully!"
+
+      # 6. Launch the native Hermes Web Dashboard headless
+      - name: Start Hermes Native Dashboard
+        run: |
+          # Use --no-open to prevent headless runner errors and bind to loopback interface
+          nohup hermes dashboard --no-open --port ${{ env.HERMES_DASHBOARD_PORT }} > hermes_dashboard.log 2>&1 &
           
-          # Bypass the interactive web onboarding wizard since we've now manually tied the model
-          export HERMES_WEBUI_SKIP_ONBOARDING=1
-          
-          # Launch the background UI server cleanly
-          nohup bash start.sh > ../hermes_ui.log 2>&1 &
-          cd ..
-          
-          echo "⏳ Waiting for Hermes WebUI server to bind to port ${{ env.HERMES_UI_PORT }}..."
+          echo "⏳ Waiting for official control plane to bind to port ${{ env.HERMES_DASHBOARD_PORT }}..."
           for i in {1..30}; do
-            if curl -s http://127.0.0.1:${{ env.HERMES_UI_PORT }} > /dev/null || [ $? -eq 52 ]; then
-              echo "✅ Hermes Community WebUI successfully verified online!"
+            if nc -z 127.0.0.1 ${{ env.HERMES_DASHBOARD_PORT }}; then
+              echo "✅ Official Hermes Dashboard is online and listening!"
               break
             fi
             sleep 3
           done
 
-      # 5. Connect Cloudflare Tunnel straight to the native Hermes UI port (8787)
+      # 7. Connect Cloudflare Tunnel straight to the native dashboard port (9119)
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
-          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.HERMES_UI_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
+          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
           for i in {1..20}; do
@@ -86,17 +93,17 @@ jobs:
           done
           sleep 5
 
-      # 6. Print accurate access route guidelines and maintain loop persistence
+      # 8. Print accurate access route guidelines and maintain loop persistence
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           BASE_URL="${{ steps.tunnel.outputs.tunnel_url }}"
           
           echo "================================================================="
-          echo "🌐 OFFICIAL HERMES WEBUI PORTAL READY:"
+          echo "🌐 OFFICIAL HERMES CONTROL PLANE PORTAL READY:"
           echo "👉 ${BASE_URL}"
           echo "================================================================="
           echo ""
-          echo "--- DASHBOARD STATUS (Previewing WebUI Workspace Boot Log) ---"
-          head -n 25 hermes_ui.log || true
+          echo "--- DASHBOARD RUNTIME LOG SNAPSHOT ---"
+          head -n 25 hermes_dashboard.log || true
           echo "================================================================="
           sleep infinity
