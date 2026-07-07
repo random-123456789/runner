@@ -55,31 +55,37 @@ jobs:
               base_url: "http://127.0.0.1:11434"
           EOF
 
-      # 6. Bind to local loopback to bypass Auth Gate
+      # 6. Bind to loopback and pass the security flags for absolute header allowance
       - name: Start Hermes Native Dashboard
+        env:
+          HERMES_ALLOWED_ORIGINS: "*"
         run: |
+          # --allowed-hosts "*" permits external connection routes
+          # --insecure disables strict origin restrictions over tunneling layers
           nohup hermes dashboard \
             --host 127.0.0.1 \
+            --port ${{ env.HERMES_DASHBOARD_PORT }} \
+            --allowed-hosts "*" \
+            --insecure \
             --no-open \
-            --skip-build \
-            --port ${{ env.HERMES_DASHBOARD_PORT }} > hermes_dashboard.log 2>&1 &
+            --skip-build > hermes_dashboard.log 2>&1 &
           
           echo "⏳ Waiting for dashboard to bind to 127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }}..."
           for i in {1..30}; do
-            if nc -z 127.0.0.1 ${{ env.HERMES_DASHBOARD_PORT }}; then
+            if nc -z 127.0.0.1 ${{ env.HERMES_DASHBOARD_PORT }} ; then
               echo "✅ Dashboard is online!"
               break
             fi
             sleep 3
           done
 
-      # 7. Map Cloudflare tunnel and rewrite host header to 127.0.0.1
+      # 7. Map Cloudflare tunnel cleanly without messing up HTTP host header variants
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
+          # Removed --http-host-header to allow clear websocket upgrade handshakes
           nohup ./cloudflared tunnel \
             --url http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} \
-            --http-host-header 127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} \
             --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
