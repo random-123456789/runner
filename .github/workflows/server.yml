@@ -8,7 +8,6 @@ permissions:
   actions: write
 
 env:
-  MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
   HERMES_DASHBOARD_PORT: 9119
 
@@ -19,31 +18,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Provision system binaries and download cloudflared
       - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl python3-pip python3-venv netcat-openbsd
-          
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      # 2. Setup Ollama runtime engine
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
 
-      # 3. Pull required weight files natively
       - name: Pull Ollama Model Weights
-        run: |
-          ollama pull ${{ env.OLLAMA_MODEL }}
+        run: ollama pull ${{ env.OLLAMA_MODEL }}
 
-      # 4. Install official hermes-agent with web-stack & pseudo-terminal modules
       - name: Install Official Hermes Agent
         run: |
           python3 -m pip install --upgrade pip
           pip install "hermes-agent[web,pty]"
 
-      # 5. Pre-seed local environment configurations
       - name: Pre-configure Hermes Runtime Environment
         run: |
           mkdir -p ~/.hermes
@@ -55,34 +47,11 @@ jobs:
               base_url: "http://127.0.0.1:11434"
           EOF
 
-      # 6. Bind to local loopback to bypass Auth Gate
-      - name: Start Hermes Native Dashboard
-        run: |
-          nohup hermes dashboard \
-            --host 127.0.0.1 \
-            --no-open \
-            --skip-build \
-            --port ${{ env.HERMES_DASHBOARD_PORT }} > hermes_dashboard.log 2>&1 &
-          
-          echo "⏳ Waiting for dashboard to bind to 127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }}..."
-          for i in {1..30}; do
-            if nc -z 127.0.0.1 ${{ env.HERMES_DASHBOARD_PORT }}; then
-              echo "✅ Dashboard is online!"
-              break
-            fi
-            sleep 3
-          done
-
-      # 7. Map Cloudflare tunnel and rewrite host header to 127.0.0.1
+      # Step 7 (Tunnel) happens first to capture the URL for Step 6 (Dashboard)
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
-          nohup ./cloudflared tunnel \
-            --url http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} \
-            --http-host-header 127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} \
-            --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
-          
-          echo "⏳ Catching TryCloudflare edge address registration..."
+          nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           for i in {1..20}; do
             URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$URL" ]; then 
@@ -91,10 +60,20 @@ jobs:
             fi
             sleep 3
           done
+
+      - name: Start Hermes Native Dashboard
+        run: |
+          # Pass the tunnel URL as an allowed-origin to fix the WebSocket disconnect
+          nohup hermes dashboard \
+            --host 127.0.0.1 \
+            --no-open \
+            --skip-build \
+            --allowed-origin "${{ steps.tunnel.outputs.tunnel_url }}" \
+            --port ${{ env.HERMES_DASHBOARD_PORT }} > hermes_dashboard.log 2>&1 &
+          
           sleep 5
 
-      # 8. Print access route and maintain keep-alive
-      - name: Print Orchestration Access Route & Keep Alive
+      - name: Print Orchestration Access Route
         run: |
           echo "================================================================="
           echo "🌐 OFFICIAL HERMES CONTROL PLANE PORTAL READY:"
