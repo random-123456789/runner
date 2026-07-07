@@ -43,14 +43,16 @@ jobs:
               base_url: "http://127.0.0.1:11434"
           EOF
           
-          # Bind to 127.0.0.1 to satisfy the Hermes auth security gate
+          # Use --insecure to bypass the strict Host header and Origin checks
+          # Bind to 127.0.0.1 to satisfy the auth-gate security requirement
           nohup hermes dashboard \
             --host 127.0.0.1 \
             --port ${{ env.HERMES_DASHBOARD_PORT }} \
+            --insecure \
             --no-open \
             --skip-build > hermes_dashboard.log 2>&1 &
           
-          # Readiness Check
+          # Readiness Probe
           echo "Waiting for dashboard to be responsive..."
           for i in {1..20}; do
             if curl -s http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} > /dev/null; then
