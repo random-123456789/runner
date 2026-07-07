@@ -43,26 +43,6 @@ jobs:
           python3 -m pip install --upgrade pip
           pip install "hermes-agent[web,pty]"
 
-      - name: Start Cloudflare Tunnel Connection
-        id: ollama
-        run: |
-          # Use an internal mapping proxy loop to reconcile the browser origin mismatch
-          ./cloudflared tunnel \
-            --url http://127.0.0.1:11434 \
-            --http-host-header "http://127.0.0.1:11434" \
-             &
-          
-          echo "⏳ Catching TryCloudflare edge address registration..."
-          for i in {1..20}; do
-            URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$URL" ]; then 
-              echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
-              break
-            fi
-            sleep 3
-          done
-          sleep 5
-
       # 5. Pre-seed local engine runtime parameters
       - name: Pre-configure Hermes Runtime Environment
         run: |
@@ -72,7 +52,7 @@ jobs:
           model: "granite4:tiny-h"
           providers:
             ollama:
-              base_url: "${{steps.ollama.outputs.tunnel_url}}"
+              base_url: "http://127.0.0.1:11434"
           EOF
 
       # 6. Initialize local server instances with global execution variables
