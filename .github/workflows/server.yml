@@ -1,10 +1,3 @@
-Yes, you absolutely can remove it! Now that we are loop-verifying the local OpenClaw gateway first, `cloudflared` will find a live port immediately when it boots up.
-
-We can completely replace the second loop with a simple 3-second wait to let `cloudflared` register its address, grab the URL using `grep`, and proceed immediately.
-
-### 📋 Cleaned-Up `.github/workflows/queen.yml` File
-
-```yaml
 name: Queen Orchestrator
 
 on:
@@ -147,5 +140,3 @@ jobs:
           head -n 20 tunnel.log || true
           echo "================================================================="
           sleep infinity
-
-```
