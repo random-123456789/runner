@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Clean, tool-based Ollama installation (No curl | sh needed)
+      # 1. Clean, tool-based Ollama installation
       - name: Setup Ollama Engine
         uses: ai-action/setup-ollama@v2
 
@@ -98,8 +98,8 @@ jobs:
           }
           EOF
 
-          # Start up with absolute cross-origin safety fallback active
-          OPENCLAW_GATEWAY_CONTROL_UI_DISABLE_ORIGIN_CHECK="true" nohup openclaw gateway start --allow-unconfigured > openclaw.log 2>&1 &
+          # Start up with absolute cross-origin safety fallback active, dropping the invalid CLI flag
+          OPENCLAW_GATEWAY_CONTROL_UI_DISABLE_ORIGIN_CHECK="true" nohup openclaw gateway start > openclaw.log 2>&1 &
           sleep 5
           cat openclaw.log || true
 
