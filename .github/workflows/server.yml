@@ -30,7 +30,7 @@ jobs:
         uses: ai-action/setup-ollama@v2
       - run: ollama pull ${{ env.OLLAMA_MODEL }}
 
-      - name: Start Hermes Native Dashboard
+      - name: Launch Hermes Dashboard
         env:
           HERMES_ALLOWED_ORIGINS: "*"
         run: |
@@ -43,20 +43,18 @@ jobs:
               base_url: "http://127.0.0.1:11434"
           EOF
           
-          # Use --insecure to bypass the strict Host header and Origin checks
-          # Bind to 127.0.0.1 to satisfy the auth-gate security requirement
+          # Add --allowed-hosts "*" to bypass the Host header security check
           nohup hermes dashboard \
             --host 127.0.0.1 \
             --port ${{ env.HERMES_DASHBOARD_PORT }} \
+            --allowed-hosts "*" \
             --insecure \
             --no-open \
-            --skip-build > hermes_dashboard.log 2>&1 &
+            --skip-build > hermes.log 2>&1 &
           
           # Readiness Probe
-          echo "Waiting for dashboard to be responsive..."
           for i in {1..20}; do
             if curl -s http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} > /dev/null; then
-              echo "Dashboard is up!"
               break
             fi
             sleep 5
