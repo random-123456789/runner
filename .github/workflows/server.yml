@@ -58,8 +58,8 @@ jobs:
           # Enforce execution permissions on your deployment script
           chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
 
-          # Inject environment variables to force open-origin parsing during the automated ollama launch process
-          export OPENCLAW_GATEWAY_CONTROL_UI_ALLOWED_ORIGINS="https://*.trycloudflare.com"
+          # Force OpenClaw to trust host headers for dynamic proxy domains like TryCloudflare
+          export OPENCLAW_GATEWAY_CONTROL_UI_DANGEROUSLY_ALLOW_HOST_HEADER_ORIGIN_FALLBACK="true"
           export OPENCLAW_GATEWAY_AUTH_MODE="none"
           
           nohup ollama launch openclaw --model ${{ env.OLLAMA_MODEL }} --yes > openclaw.log 2>&1 &
