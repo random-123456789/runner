@@ -59,7 +59,7 @@ jobs:
               mkdir -p /root/.hermes && \
               echo 'provider: \"ollama\"' > /root/.hermes/config.yaml && \
               echo 'model: \"granite4-64k\"' >> /root/.hermes/config.yaml && \
-              providers: >> /root/.hermes/config.yaml && \
+              echo 'providers:' >> /root/.hermes/config.yaml && \
               echo '  ollama:' >> /root/.hermes/config.yaml && \
               echo '    base_url: \"http://host.docker.internal:11434\"' >> /root/.hermes/config.yaml && \
               hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_DASHBOARD_PORT }} --no-open --skip-build
@@ -69,17 +69,17 @@ jobs:
           sleep 15
           docker logs hermes-dashboard
 
-      # 5. Direct the Cloudflare Tunnel client with the correct HTTP header patch
+      # 5. Direct the Cloudflare Tunnel client with transport and host headers optimized
       - name: Start Cloudflare Tunnel Container
         run: |
-          # Uses the exact '--http-host-header' flag to bypass the dashboard security restrictions
           docker run -d \
             --name cloudflared-tunnel \
             --network hermes-net \
             cloudflare/cloudflared:latest \
             tunnel \
             --url http://hermes-dashboard:${{ env.HERMES_DASHBOARD_PORT }} \
-            --http-host-header "hermes-dashboard:${{ env.HERMES_DASHBOARD_PORT }}"
+            --http-host-header "hermes-dashboard:${{ env.HERMES_DASHBOARD_PORT }}" \
+            --no-tls-verify
 
           echo "⏳ Catching dynamic public edge route URL..."
           # Active loop to reliably catch the ephemeral address from container logs
