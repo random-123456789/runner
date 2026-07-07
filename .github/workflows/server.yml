@@ -36,7 +36,7 @@ jobs:
           sleep 5
           ollama pull ${{ env.OLLAMA_MODEL }}
 
-      - name: Launch OpenClaw Gateway via Ollama
+      - name: Pre-build Architecture & Skills Layout
         run: |
           # Create custom skill workspace folder for your launcher script
           mkdir -p ~/.openclaw/workspace/skills/run_worker
@@ -58,26 +58,10 @@ jobs:
           # Enforce execution permissions on your deployment script
           chmod +x $GITHUB_WORKSPACE/scripts/worker_launcher.sh
 
-          # Force OpenClaw to trust host headers for dynamic proxy domains like TryCloudflare
-          export OPENCLAW_GATEWAY_CONTROL_UI_DANGEROUSLY_ALLOW_HOST_HEADER_ORIGIN_FALLBACK="true"
-          export OPENCLAW_GATEWAY_AUTH_MODE="none"
-          
-          nohup ollama launch openclaw --model ${{ env.OLLAMA_MODEL }} --yes > openclaw.log 2>&1 &
-          
-          echo "⏳ Waiting for OpenClaw Gateway to bind to port ${{ env.GATEWAY_PORT }}..."
-          for i in {1..20}; do
-            if curl -s http://127.0.0.1:${{ env.GATEWAY_PORT }} > /dev/null || [ $? -eq 52 ]; then
-              echo "✅ OpenClaw Gateway successfully verified online!"
-              break
-            fi
-            echo "Keep waiting... ($i/20)"
-            sleep 3
-          done
-
-      - name: Start Cloudflare Tunnel Connection
+      - name: Start Cloudflare Tunnel and Catch Dynamic URL
         id: tunnel
         run: |
-          # Route tunnel requests cleanly to loopback interface mapping
+          # Run cloudflared first. It won't throw a 502 error instantly on startup anymore
           nohup ./cloudflared tunnel --url http://127.0.0.1:${{ env.GATEWAY_PORT }} --metrics 127.0.0.1:45455 > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
@@ -90,21 +74,69 @@ jobs:
             fi
             sleep 3
           done
-          
-          # Allow edge propagation buffer time before link interaction
           sleep 5
+
+      - name: Configure and Launch OpenClaw Natively
+        run: |
+          TUNNEL_URL="${{ steps.tunnel.outputs.tunnel_url }}"
+          
+          # Write out the clean json file structure directly with the dynamic URL populated perfectly
+          mkdir -p ~/.openclaw
+          cat << EOF > ~/.openclaw/openclaw.json
+          {
+            "gateway": {
+              "port": 18789,
+              "mode": "local",
+              "bind": "loopback",
+              "auth": {
+                "mode": "none"
+              },
+              "controlUi": {
+                "allowedOrigins": ["$TUNNEL_URL"]
+              }
+            },
+            "agents": {
+              "defaults": {
+                "model": "ollama/granite4:tiny-h"
+              }
+            },
+            "models": {
+              "providers": {
+                "ollama": {
+                  "baseUrl": "http://127.0.0.1:11434",
+                  "models": [
+                    { 
+                      "id": "granite4:tiny-h", 
+                      "name": "granite4:tiny-h",
+                      "api": "ollama" 
+                    }
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+
+          # Boot up the openclaw gateway engine using the config file we just tailor-made
+          nohup openclaw gateway start --allow-unconfigured > openclaw.log 2>&1 &
+          
+          echo "⏳ Verifying control gateway boot sequence..."
+          for i in {1..20}; do
+            if curl -s http://127.0.0.1:${{ env.GATEWAY_PORT }} > /dev/null || [ $? -eq 52 ]; then
+              echo "✅ OpenClaw Gateway is securely online!"
+              break
+            fi
+            sleep 3
+          done
 
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           echo "================================================================="
-          echo "🌐 OPENCLAW PORTAL ROUTE: ${{ steps.tunnel.outputs.tunnel_url }}"
+          echo "🌐 OPENCLAW SECURE PORTAL ROUTE:"
+          echo "   ${{ steps.tunnel.outputs.tunnel_url }}"
           echo "================================================================="
           echo ""
-          echo "--- LOG DIAGNOSTICS (OpenClaw Output Preview) ---"
-          head -n 40 openclaw.log || true
-          echo ""
-          echo "--- LOG DIAGNOSTICS (Cloudflared Output Preview) ---"
-          head -n 20 tunnel.log || true
+          echo "🔑 NO TOKEN REQUIRED (Auth Mode: None)"
           echo "================================================================="
           
           # Hold runner pipeline open
