@@ -59,7 +59,7 @@ jobs:
               mkdir -p /root/.hermes && \
               echo 'provider: \"ollama\"' > /root/.hermes/config.yaml && \
               echo 'model: \"granite4-64k\"' >> /root/.hermes/config.yaml && \
-              echo 'providers:' >> /root/.hermes/config.yaml && \
+              providers: >> /root/.hermes/config.yaml && \
               echo '  ollama:' >> /root/.hermes/config.yaml && \
               echo '    base_url: \"http://host.docker.internal:11434\"' >> /root/.hermes/config.yaml && \
               hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_DASHBOARD_PORT }} --no-open --skip-build
@@ -69,25 +69,25 @@ jobs:
           sleep 15
           docker logs hermes-dashboard
 
-      # 5. Direct the Cloudflare Tunnel client with Host Header Override patches
+      # 5. Direct the Cloudflare Tunnel client with the correct HTTP header patch
       - name: Start Cloudflare Tunnel Container
-        id: tunnel
         run: |
-          # Added --http-header override to satisfy the dashboard's strict host boundary checks
+          # Uses the exact '--http-host-header' flag to bypass the dashboard security restrictions
           docker run -d \
             --name cloudflared-tunnel \
             --network hermes-net \
             cloudflare/cloudflared:latest \
             tunnel \
             --url http://hermes-dashboard:${{ env.HERMES_DASHBOARD_PORT }} \
-            --http-header "Host: hermes-dashboard:${{ env.HERMES_DASHBOARD_PORT }}"
+            --http-host-header "hermes-dashboard:${{ env.HERMES_DASHBOARD_PORT }}"
 
           echo "⏳ Catching dynamic public edge route URL..."
           # Active loop to reliably catch the ephemeral address from container logs
           for i in {1..20}; do
             URL=$(docker logs cloudflared-tunnel 2>&1 | grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' | head -1)
             if [ -n "$URL" ]; then 
-              echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
+              echo "TUNNEL_URL=$URL" >> $GITHUB_ENV
+              echo "✅ URL Captured: $URL"
               break
             fi
             sleep 3
@@ -98,6 +98,6 @@ jobs:
         run: |
           echo "================================================================="
           echo "🌐 OFFICIAL HERMES CONTROL PLANE PORTAL READY:"
-          echo "👉 ${{ steps.tunnel.outputs.tunnel_url }}"
+          echo "👉 ${{ env.TUNNEL_URL }}"
           echo "================================================================="
           sleep infinity
