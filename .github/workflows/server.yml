@@ -30,28 +30,36 @@ jobs:
         uses: ai-action/setup-ollama@v2
       - run: ollama pull ${{ env.OLLAMA_MODEL }}
 
-      - name: Launch Hermes Dashboard
+      - name: Start Hermes Native Dashboard
+        env:
+          HERMES_ALLOWED_ORIGINS: "*"
         run: |
           mkdir -p ~/.hermes
-          # Start dashboard in the background
-          # Note: Using 0.0.0.0 ensures it binds to all network interfaces
+          cat << 'EOF' > ~/.hermes/config.yaml
+          provider: "ollama"
+          model: "granite4:tiny-h"
+          providers:
+            ollama:
+              base_url: "http://127.0.0.1:11434"
+          EOF
+          
+          # Bind to 127.0.0.1 to satisfy the Hermes auth security gate
           nohup hermes dashboard \
-            --host 0.0.0.0 \
+            --host 127.0.0.1 \
             --port ${{ env.HERMES_DASHBOARD_PORT }} \
             --no-open \
-            --skip-build > hermes.log 2>&1 &
+            --skip-build > hermes_dashboard.log 2>&1 &
           
-          # CRITICAL: Wait until the port is actually responding
-          echo "Waiting for Hermes Dashboard to be responsive..."
-          for i in {1..40}; do
+          # Readiness Check
+          echo "Waiting for dashboard to be responsive..."
+          for i in {1..20}; do
             if curl -s http://127.0.0.1:${{ env.HERMES_DASHBOARD_PORT }} > /dev/null; then
-              echo "Dashboard is live!"
+              echo "Dashboard is up!"
               break
             fi
-            echo "Waiting ($i/40)..."
             sleep 5
           done
-
+          
       - name: Start Cloudflare Tunnel
         id: tunnel
         run: |
