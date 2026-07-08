@@ -32,19 +32,32 @@ jobs:
           export PATH="$HOME/.hermes/bin:$PATH"
 
       # ---------- Install Holesail and SSH server ----------
-      - name: Install Holesail and OpenSSH
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y openssh-server nodejs npm
           sudo npm install -g holesail
-          # Create a password for the runner user (so we can SSH with password)
-          sudo passwd runner <<< "runner123\nrunner123"
+
+      # ---------- Set SSH password (non-interactive) ----------
+      - name: Set SSH password
+        run: |
+          echo "runner:runner123" | sudo chpasswd
+
+      # ---------- Configure SSH server ----------
+      - name: Configure SSH
+        run: |
+          # Allow password authentication
+          sudo sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          # Allow root login if needed (optional)
+          sudo sed -i 's/^#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
 
       # ---------- Start SSH server ----------
-      - name: Start SSH server
+      - name: Start SSH
         run: |
-          sudo service ssh start
-          # Verify SSH is running
+          sudo service ssh restart
+          sudo systemctl status ssh || echo "SSH service status check"
+          # Verify SSH is listening
           sudo netstat -tulpn | grep :22 || echo "SSH not running"
 
       # ---------- Start Ollama service ----------
@@ -55,7 +68,6 @@ jobs:
       - name: Expose SSH with Holesail
         id: holesail
         run: |
-          # Expose port 22 with Holesail – bind to 0.0.0.0 to allow connections
           holesail --live ${{ env.SSH_PORT }} --public > holesail.log 2>&1 &
           sleep 10
           CONNECTION_KEY=$(grep -oP 'hs://[a-zA-Z0-9]+' holesail.log | head -1)
@@ -90,7 +102,6 @@ jobs:
           echo ""
           echo "   4. You now have a full SSH session on the runner!"
           echo "      Run 'hermes chat --model ${{ env.OLLAMA_MODEL }}' to start chatting."
-          echo "      Or start the dashboard: hermes dashboard --host 0.0.0.0 --port 18789"
           echo ""
           echo "💡 The connection is direct P2P – no lag, no relay servers!"
           echo "================================================================="
