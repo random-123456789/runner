@@ -34,12 +34,25 @@ jobs:
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
 
-      - name: Start Ollama service
-        run: ollama serve &
-
-      - name: Configure Hermes with auth
+      - name: Configure Ollama provider
         run: |
           mkdir -p ~/.hermes
+          cat > ~/.hermes/config.yaml << EOF
+          model:
+            provider: ollama
+            model: ${{ env.OLLAMA_MODEL }}
+            baseUrl: http://localhost:11434
+          agents:
+            default:
+              model: ${{ env.OLLAMA_MODEL }}
+              systemPrompt: "You are a helpful assistant."
+          gateway:
+            port: ${{ env.HERMES_PORT }}
+            host: 0.0.0.0
+          EOF
+
+      - name: Configure Hermes authentication
+        run: |
           PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
           SECRET=$(openssl rand -base64 32)
           cat > ~/.hermes/.env << EOF
@@ -48,6 +61,9 @@ jobs:
           HERMES_DASHBOARD_BASIC_AUTH_SECRET=$SECRET
           EOF
           echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
+
+      - name: Start Ollama service
+        run: ollama serve &
 
       - name: Start Hermes Dashboard
         run: |
@@ -60,6 +76,7 @@ jobs:
               echo "✅ Dashboard ready"
               break
             fi
+            echo "⏳ Waiting for dashboard... ($i/20)"
             sleep 2
           done
 
@@ -86,5 +103,7 @@ jobs:
           echo ""
           echo "🔐 Username: admin"
           echo "🔐 Password: ${{ env.ADMIN_PASSWORD }}"
+          echo ""
+          echo "💡 The model 'granite4:tiny-h' is configured as the default."
           echo "================================================================="
           sleep infinity
