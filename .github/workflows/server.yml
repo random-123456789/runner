@@ -1,4 +1,4 @@
-name: Queen (Hermes + Ollama) with Interactive Shell
+name: Queen (Hermes + Ollama) with Interactive Bash Shell
 
 on:
   workflow_dispatch:
@@ -38,10 +38,10 @@ jobs:
       - name: Start Ollama
         run: ollama serve &
 
-      # ---------- Improved interactive shell server ----------
+      # ---------- Full interactive shell server ----------
       - name: Start interactive shell server
         run: |
-          socat TCP-LISTEN:${{ env.SHELL_PORT }},fork EXEC:'script -q -c /bin/bash',pty,raw,echo=0 &
+          socat TCP-LISTEN:${{ env.SHELL_PORT }},fork EXEC:'TERM=xterm-256color bash -i',pty,raw,echo=0 &
           sleep 2
 
       - name: Expose shell with Holesail
@@ -65,18 +65,18 @@ jobs:
           echo "🔑 Holesail Connection Key:"
           echo "   $CONNECTION_KEY"
           echo ""
-          echo "🌐 To get a FULL bash shell (with history, colors, tab completion):"
+          echo "🌐 To get a FULL interactive bash shell:"
           echo ""
-          echo "   1. Install Holesail on your local machine:"
+          echo "   1. Install Holesail:"
           echo "      npm install -g holesail"
           echo ""
-          echo "   2. Start Holesail client (keep this terminal open):"
+          echo "   2. Start Holesail client (keep terminal open):"
           echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.SHELL_PORT }}"
           echo ""
-          echo "   3. In a NEW terminal, connect with:"
+          echo "   3. In another terminal, connect with:"
           echo "      nc localhost ${{ env.SHELL_PORT }}"
           echo ""
-          echo "   That's it! You'll get a full interactive bash shell."
+          echo "   That's it – full bash with colors, history, tab completion!"
           echo "   Run 'hermes chat --model ${{ env.OLLAMA_MODEL }}' to start chatting."
           echo "================================================================="
           sleep infinity
