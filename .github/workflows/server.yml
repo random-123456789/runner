@@ -35,13 +35,15 @@ jobs:
       - name: Install Penelope and Holesail
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y nodejs npm python3 wget
+          sudo apt-get install -y nodejs npm python3 python3-pip
           sudo npm install -g holesail
-          # Download Penelope
-          wget -q -O /tmp/penelope.py https://raw.githubusercontent.com/brightio/penelope/refs/heads/main/penelope.py
-          chmod +x /tmp/penelope.py
-          # Verify it downloaded
-          ls -la /tmp/penelope.py || { echo "❌ Penelope download failed"; exit 1; }
+          # Install Penelope via pipx (clean, correct method)
+          python3 -m pip install --user pipx
+          python3 -m pipx ensurepath
+          export PATH="$HOME/.local/bin:$PATH"
+          pipx install penelope-shell-handler
+          # Verify installation
+          penelope --version || { echo "❌ Penelope installation failed"; exit 1; }
 
       # ---------- Start Ollama (if not running) ----------
       - name: Start Ollama
@@ -56,10 +58,11 @@ jobs:
       # ---------- Start Penelope server ----------
       - name: Start Penelope
         run: |
+          export PATH="$HOME/.local/bin:$PATH"
           # Kill any process using the port
           sudo fuser -k ${{ env.SHELL_PORT }}/tcp || true
-          # Start Penelope in background with logging
-          nohup python3 /tmp/penelope.py -p ${{ env.SHELL_PORT }} --auto > penelope.log 2>&1 &
+          # Start Penelope in background
+          nohup penelope -p ${{ env.SHELL_PORT }} --no-upgrade > penelope.log 2>&1 &
           sleep 5
           # Check if it's listening
           if netstat -tulpn 2>/dev/null | grep -q ":${{ env.SHELL_PORT }}"; then
@@ -67,9 +70,8 @@ jobs:
           else
             echo "❌ Penelope not listening. Logs:"
             cat penelope.log
-            # Try to run it in foreground to see error
-            echo "Running in foreground to debug:"
-            python3 /tmp/penelope.py -p ${{ env.SHELL_PORT }} --auto &
+            # Try foreground for debugging
+            penelope -p ${{ env.SHELL_PORT }} --no-upgrade &
             sleep 5
             netstat -tulpn | grep :${{ env.SHELL_PORT }} || { echo "❌ Still not listening"; exit 1; }
           fi
@@ -116,10 +118,13 @@ jobs:
           echo "   1. Install Holesail on your local machine:"
           echo "      npm install -g holesail"
           echo ""
-          echo "   2. Start the Holesail client (keep this terminal open):"
+          echo "   2. Install Penelope on your local machine (optional):"
+          echo "      pipx install penelope-shell-handler"
+          echo ""
+          echo "   3. Start the Holesail client (keep this terminal open):"
           echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.SHELL_PORT }}"
           echo ""
-          echo "   3. In a NEW terminal, connect with:"
+          echo "   4. In a NEW terminal, connect with:"
           echo "      nc localhost ${{ env.SHELL_PORT }}"
           echo ""
           echo "   That's it! Penelope will automatically give you a full PTY."
@@ -130,8 +135,8 @@ jobs:
           echo "     - Tab completion"
           echo "     - Window resize support"
           echo "     - File transfers (download / upload)"
-          echo "     - Session management (press F12 for menu)"
+          echo "     - Session management"
           echo ""
-          echo "   After connecting, press F12 to return to Penelope's control menu."
+          echo "   After connecting, press F12 to return to Penelope's menu."
           echo "================================================================="
           sleep infinity
