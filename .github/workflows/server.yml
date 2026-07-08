@@ -35,24 +35,44 @@ jobs:
       - name: Install Penelope and Holesail
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y nodejs npm python3
+          sudo apt-get install -y nodejs npm python3 wget
           sudo npm install -g holesail
           # Download Penelope
           wget -q -O /tmp/penelope.py https://raw.githubusercontent.com/brightio/penelope/refs/heads/main/penelope.py
           chmod +x /tmp/penelope.py
+          # Verify it downloaded
+          ls -la /tmp/penelope.py || { echo "❌ Penelope download failed"; exit 1; }
 
-      # ---------- Start Ollama ----------
+      # ---------- Start Ollama (if not running) ----------
       - name: Start Ollama
-        run: ollama serve &
+        run: |
+          if ! pgrep -f "ollama serve" > /dev/null; then
+            ollama serve &
+            sleep 3
+          else
+            echo "✅ Ollama already running"
+          fi
 
       # ---------- Start Penelope server ----------
       - name: Start Penelope
         run: |
-          # Run Penelope in the background, auto‑upgrade shells, listen on SHELL_PORT
+          # Kill any process using the port
+          sudo fuser -k ${{ env.SHELL_PORT }}/tcp || true
+          # Start Penelope in background with logging
           nohup python3 /tmp/penelope.py -p ${{ env.SHELL_PORT }} --auto > penelope.log 2>&1 &
-          sleep 3
-          # Verify it's listening
-          netstat -tulpn | grep :${{ env.SHELL_PORT }} || { echo "❌ Penelope not listening"; exit 1; }
+          sleep 5
+          # Check if it's listening
+          if netstat -tulpn 2>/dev/null | grep -q ":${{ env.SHELL_PORT }}"; then
+            echo "✅ Penelope listening on port ${{ env.SHELL_PORT }}"
+          else
+            echo "❌ Penelope not listening. Logs:"
+            cat penelope.log
+            # Try to run it in foreground to see error
+            echo "Running in foreground to debug:"
+            python3 /tmp/penelope.py -p ${{ env.SHELL_PORT }} --auto &
+            sleep 5
+            netstat -tulpn | grep :${{ env.SHELL_PORT }} || { echo "❌ Still not listening"; exit 1; }
+          fi
 
       # ---------- Start Hermes Dashboard (optional) ----------
       - name: Start Hermes Dashboard
@@ -113,6 +133,5 @@ jobs:
           echo "     - Session management (press F12 for menu)"
           echo ""
           echo "   After connecting, press F12 to return to Penelope's control menu."
-          echo "   From there you can list sessions, download/upload files, etc."
           echo "================================================================="
           sleep infinity
