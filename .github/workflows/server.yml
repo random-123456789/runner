@@ -1,4 +1,4 @@
-name: Queen (Hermes + Ollama) with Fast Interactive Shell
+name: Queen (Hermes + Ollama) with Penelope Shell
 
 on:
   workflow_dispatch:
@@ -17,33 +17,59 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ---------- Setup Ollama ----------
       - name: Setup Ollama
         uses: ai-action/setup-ollama@v1
 
       - name: Pull Ollama model
         run: ollama pull ${{ env.OLLAMA_MODEL }}
 
+      # ---------- Install Hermes Agent ----------
       - name: Install Hermes Agent
         run: |
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
 
-      - name: Install socat and Holesail
+      # ---------- Install Penelope and Holesail ----------
+      - name: Install Penelope and Holesail
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y socat nodejs npm
+          sudo apt-get install -y nodejs npm python3
           sudo npm install -g holesail
+          # Download Penelope
+          wget -q -O /tmp/penelope.py https://raw.githubusercontent.com/brightio/penelope/refs/heads/main/penelope.py
+          chmod +x /tmp/penelope.py
 
+      # ---------- Start Ollama ----------
       - name: Start Ollama
         run: ollama serve &
 
-      - name: Start fully interactive shell server
+      # ---------- Start Penelope server ----------
+      - name: Start Penelope
         run: |
-          socat TCP-LISTEN:${{ env.SHELL_PORT }},nodelay,fork EXEC:'env TERM=xterm-256color bash -li',pty,raw,echo=0,stderr,setsid,sigint,sane &
-          sleep 2
+          # Run Penelope in the background, auto‑upgrade shells, listen on SHELL_PORT
+          nohup python3 /tmp/penelope.py -p ${{ env.SHELL_PORT }} --auto > penelope.log 2>&1 &
+          sleep 3
+          # Verify it's listening
+          netstat -tulpn | grep :${{ env.SHELL_PORT }} || { echo "❌ Penelope not listening"; exit 1; }
 
-      - name: Expose shell with Holesail
+      # ---------- Start Hermes Dashboard (optional) ----------
+      - name: Start Hermes Dashboard
+        run: |
+          export PATH="$HOME/.hermes/bin:$PATH"
+          hermes dashboard --host 0.0.0.0 --port 18789 --no-open &
+          sleep 10
+          for i in {1..10}; do
+            if curl -s http://localhost:18789/health > /dev/null; then
+              echo "✅ Hermes Dashboard ready"
+              break
+            fi
+            sleep 2
+          done
+
+      # ---------- Expose shell port via Holesail ----------
+      - name: Expose Penelope with Holesail
         id: holesail
         run: |
           holesail --live ${{ env.SHELL_PORT }} --public > holesail.log 2>&1 &
@@ -56,6 +82,7 @@ jobs:
           fi
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
 
+      # ---------- Print access instructions ----------
       - name: Print access
         env:
           CONNECTION_KEY: ${{ steps.holesail.outputs.connection_key }}
@@ -64,7 +91,7 @@ jobs:
           echo "🔑 Holesail Connection Key:"
           echo "   $CONNECTION_KEY"
           echo ""
-          echo "🌐 To get a FAST, FULLY INTERACTIVE shell:"
+          echo "🌐 To get a FULL, LAG‑FREE interactive shell on the runner:"
           echo ""
           echo "   1. Install Holesail on your local machine:"
           echo "      npm install -g holesail"
@@ -72,17 +99,20 @@ jobs:
           echo "   2. Start the Holesail client (keep this terminal open):"
           echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.SHELL_PORT }}"
           echo ""
-          echo "   3. In a NEW terminal, connect with one of these:"
-          echo ""
-          echo "      # Best (full PTY, no hangs, fast):"
-          echo "      socat PTY,raw,echo=0 TCP:localhost:${{ env.SHELL_PORT }},nodelay"
-          echo ""
-          echo "      # Alternative (script + nc, also works):"
-          echo "      script -q -c \"nc localhost ${{ env.SHELL_PORT }}\""
-          echo ""
-          echo "      # Simple fallback (no arrow keys):"
+          echo "   3. In a NEW terminal, connect with:"
           echo "      nc localhost ${{ env.SHELL_PORT }}"
           echo ""
-          echo "   (All should now give you arrow keys, Ctrl+C, Ctrl+Z, tab completion, etc.)"
+          echo "   That's it! Penelope will automatically give you a full PTY."
+          echo ""
+          echo "   Features:"
+          echo "     - Arrow keys / history"
+          echo "     - Ctrl+C (SIGINT), Ctrl+Z (job control)"
+          echo "     - Tab completion"
+          echo "     - Window resize support"
+          echo "     - File transfers (download / upload)"
+          echo "     - Session management (press F12 for menu)"
+          echo ""
+          echo "   After connecting, press F12 to return to Penelope's control menu."
+          echo "   From there you can list sessions, download/upload files, etc."
           echo "================================================================="
           sleep infinity
