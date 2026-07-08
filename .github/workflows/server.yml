@@ -44,10 +44,16 @@ jobs:
         run: |
           echo "runner:runner123" | sudo chpasswd
 
-      # ---------- Generate SSH host keys (critical!) ----------
+      # ---------- Generate SSH host keys ----------
       - name: Generate SSH host keys
         run: |
           sudo ssh-keygen -A
+
+      # ---------- Create privilege separation directory ----------
+      - name: Create privilege separation directory
+        run: |
+          sudo mkdir -p /run/sshd
+          sudo chmod 755 /run/sshd
 
       # ---------- Configure SSH on port 2222 ----------
       - name: Configure SSH
@@ -56,13 +62,12 @@ jobs:
           sudo sed -i 's/^Port.*/Port ${{ env.SSH_PORT }}/' /etc/ssh/sshd_config
           sudo sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          # Validate configuration before starting
+          # Validate configuration
           sudo sshd -t || { echo "❌ Invalid SSH config"; exit 1; }
 
       # ---------- Start SSH server ----------
       - name: Start SSH
         run: |
-          # Ensure no process is using the port
           sudo fuser -k ${{ env.SSH_PORT }}/tcp || true
           sudo systemctl restart ssh
           sleep 3
