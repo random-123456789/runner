@@ -4,31 +4,33 @@ on:
 permissions:
   contents: write
   actions: write
+
 env:
   MAX_WORKERS: 19
   OLLAMA_MODEL: granite4:tiny-h
-  HERMES_BACKEND_PORT: 9120
-  HERMES_PUBLIC_PORT: 8888
+  DOCKER_PORT: 8000
+
 jobs:
   queen:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-mins: 360
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Install System Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl python3-pip python3-venv netcat-openbsd nginx
+          sudo apt-get install -y curl python3-pip python3-venv netcat-openbsd
+          
           curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
-          
-      - name: Setup Ollama Engine
+
+      - name: Setup Ollama Engine (Native for Speed)
         uses: ai-action/setup-ollama@v2
-        
-      - name: Pull Ollama Model Weights
+
+      - name: Pull Ollama Model Weights (Native)
         run: ollama pull ${{ env.OLLAMA_MODEL }}
-          
+
       - name: Verify Ollama is Ready
         run: |
           echo "⏳ Waiting for Ollama API..."
@@ -40,110 +42,76 @@ jobs:
             sleep 2
           done
 
-      - name: Install Official Hermes Agent
-        run: |
-          python3 -m pip install --upgrade pip
-          pip install "hermes-agent[web,pty]"
-          
-      - name: Pre-configure Hermes Runtime Environment
+      # Write the docker-compose file that runs the unified gateway
+      - name: Write Docker Compose File
         run: |
           mkdir -p ~/.hermes
+          
+          # NOTE: We use host.docker.internal:11434 so the container can find 
+          # the natively running Ollama outside the container!
           cat << 'EOF' > ~/.hermes/config.yaml
           provider: "ollama"
           model: "granite4:tiny-h"
           providers:
             ollama:
-              base_url: "http://127.0.0.1:11434"
+              base_url: "http://host.docker.internal:11434"
           EOF
           
-      - name: Start Hermes Backend Server
-        env:
-          HERMES_ALLOWED_ORIGINS: "*"
-          HERMES_ALLOWED_HOSTS: "*"
-          HERMES_DISABLE_CSRF: "true"
-          HERMES_INSECURE: "true"
+          cat << 'EOF' > docker-compose.yml
+          version: '3.8'
+          services:
+            hermes:
+              image: python:3.12-slim
+              working_dir: /app
+              # Install Hermes and start the unified backend/frontend gateway
+              command: sh -c "pip install -q 'hermes-agent[web,pty]' && hermes serve --host 0.0.0.0 --port 8000"
+              environment:
+                HERMES_ALLOWED_ORIGINS: "*"
+                HERMES_ALLOWED_HOSTS: "*"
+                HERMES_DISABLE_CSRF: "true"
+                HERMES_INSECURE: "true"
+              ports:
+                - "${{ env.DOCKER_PORT }}:8000"
+              volumes:
+                - ~/.hermes:/root/.hermes
+              # Crucial: Allows the container to resolve the host machine's Ollama
+              extra_hosts:
+                - "host.docker.internal:host-gateway"
+          EOF
+
+      # Start the Docker container in the background
+      - name: Start Hermes Unified Gateway via Docker
         run: |
-          echo "🚀 Starting Hermes backend API server..."
-          nohup hermes serve --host 127.0.0.1 --port ${{ env.HERMES_BACKEND_PORT }} > hermes_backend.log 2>&1 &
+          docker compose up -d --build
           
-          echo "⏳ Waiting for backend to bind..."
-          for i in {1..15}; do
-            if nc -z 127.0.0.1 ${{ env.HERMES_BACKEND_PORT }}; then
-              echo "✅ Backend API is online!"
+          echo "⏳ Waiting for Docker container to bind to port ${{ env.DOCKER_PORT }}..."
+          for i in {1..30}; do
+            if nc -z 127.0.0.1 ${{ env.DOCKER_PORT }}; then
+              echo "✅ Docker Gateway is online!"
               break
             fi
-            sleep 2
+            sleep 3
           done
 
-      # FIXED: Added chmod to allow Nginx to read the files
-      - name: Configure Nginx as Static Server & Proxy
-        run: |
-          WEB_DIST=$(find /home/runner/.local -path "*/hermes_cli/web_dist" -type d | head -n 1)
-          
-          if [ -z "$WEB_DIST" ]; then
-            echo "❌ Could not find web_dist!"
-            exit 1
-          fi
-          
-          echo "📂 Found frontend at: $WEB_DIST"
-          
-          # Grant Nginx (www-data) permission to read the frontend files
-          chmod -R a+rX "$WEB_DIST"
-          
-          sudo tee /etc/nginx/sites-available/hermes > /dev/null <<EOF
-          server {
-              listen ${{ env.HERMES_PUBLIC_PORT }};
-              
-              # 1. Serve frontend files directly
-              location / {
-                  root $WEB_DIST;
-                  try_files \$uri \$uri/ /index.html;
-              }
-
-              # 2. Proxy WebSocket connections to the backend
-              location /ws {
-                  proxy_pass http://127.0.0.1:${{ env.HERMES_BACKEND_PORT }};
-                  proxy_http_version 1.1;
-                  proxy_set_header Upgrade \$http_upgrade;
-                  proxy_set_header Connection "upgrade";
-                  proxy_set_header Host \$host;
-                  proxy_set_header Origin \$http_origin;
-              }
-
-              # 3. Proxy standard API calls to the backend
-              location /api {
-                  proxy_pass http://127.0.0.1:${{ env.HERMES_BACKEND_PORT }};
-                  proxy_set_header Host \$host;
-                  proxy_set_header Origin \$http_origin;
-              }
-          }
-          EOF
-          
-          sudo ln -sf /etc/nginx/sites-available/hermes /etc/nginx/sites-enabled/
-          sudo rm -f /etc/nginx/sites-enabled/default
-          sudo nginx -t && sudo systemctl restart nginx
-          echo "✅ Nginx is serving UI and proxying API!"
-          
+      # Point tunnel directly to the unified Docker port
       - name: Start Cloudflare Tunnel Connection
         id: tunnel
         run: |
+          # NO --http-host-header hack needed here! Docker handles host networking cleanly.
           nohup ./cloudflared tunnel \
-            --url http://127.0.0.1:${{ env.HERMES_PUBLIC_PORT }} > tunnel.log 2>&1 &
-          
-          sleep 2
+            --url http://127.0.0.1:${{ env.DOCKER_PORT }} > tunnel.log 2>&1 &
           
           echo "⏳ Catching TryCloudflare edge address registration..."
           for i in {1..20}; do
-            URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
+            URL=$(grep -oP 'https://[a-zA-Z00-9-]+\.trycloudflare\.com' tunnel.log | head -1)
             if [ -n "$URL" ]; then 
-              echo "✅ Tunnel successfully established!"
               echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
               break
             fi
-            echo "Waiting for Cloudflare edge... (Attempt $i/20)" 
             sleep 3
           done
-          
+          sleep 5
+
       - name: Print Orchestration Access Route & Keep Alive
         run: |
           echo "================================================================="
