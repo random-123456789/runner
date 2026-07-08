@@ -1,4 +1,4 @@
-name: Queen (Hermes Agent + Ollama)
+name: Queen (Hermes + Ollama) via SSH
 
 on:
   workflow_dispatch:
@@ -9,7 +9,6 @@ permissions:
 env:
   OLLAMA_MODEL: granite4:tiny-h
   HERMES_PORT: 18789
-  HERMES_DEFAULT_MODEL: granite4:tiny-h
 
 jobs:
   queen:
@@ -18,24 +17,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ---------- Setup Ollama ----------
       - name: Setup Ollama
         uses: ai-action/setup-ollama@v1
 
       - name: Pull Ollama model
         run: ollama pull ${{ env.OLLAMA_MODEL }}
 
+      # ---------- Install Hermes Agent ----------
       - name: Install Hermes Agent
         run: |
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
 
-      - name: Install Cloudflared
+      # ---------- Install tmate ----------
+      - name: Install tmate
         run: |
-          curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x cloudflared
+          sudo apt-get update -qq
+          sudo apt-get install -y tmate
+          # Alternatively, download latest release:
+          # curl -L -o tmate.tar.gz https://github.com/tmate-io/tmate/releases/latest/download/tmate-linux-amd64.tar.gz
+          # tar -xzf tmate.tar.gz
+          # sudo mv tmate-linux-amd64/tmate /usr/local/bin/
 
-      - name: Create Hermes config with model
+      # ---------- Create Hermes config ----------
+      - name: Configure Hermes
         run: |
           mkdir -p ~/.hermes
           cat > ~/.hermes/config.yaml << EOF
@@ -47,9 +54,7 @@ jobs:
             port: ${{ env.HERMES_PORT }}
             host: 0.0.0.0
           EOF
-
-      - name: Configure dashboard auth
-        run: |
+          # Auth credentials
           PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
           SECRET=$(openssl rand -base64 32)
           cat > ~/.hermes/.env << EOF
@@ -59,13 +64,14 @@ jobs:
           EOF
           echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
 
-      - name: Start Ollama service
+      # ---------- Start Ollama service ----------
+      - name: Start Ollama
         run: ollama serve &
 
-      - name: Start Hermes Dashboard (with model env)
+      # ---------- Start Hermes Dashboard ----------
+      - name: Start Hermes Dashboard
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
-          export HERMES_DEFAULT_MODEL="${{ env.OLLAMA_MODEL }}"
           set -a; source ~/.hermes/.env; set +a
           hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open &
           sleep 15
@@ -77,30 +83,39 @@ jobs:
             sleep 2
           done
 
-      - name: Start Cloudflare Tunnel
-        id: tunnel
+      # ---------- Start tmate (SSH) ----------
+      - name: Start tmate
+        id: tmate
         run: |
-          nohup ./cloudflared tunnel --url http://localhost:${{ env.HERMES_PORT }} > tunnel.log 2>&1 &
+          # Start tmate in the background and capture the connection string
+          tmate -F > /tmp/tmate_output.log 2>&1 &
+          # Wait for the SSH connection string to appear
           for i in {1..30}; do
-            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -1)
-            if [ -n "$TUNNEL_URL" ]; then
-              echo "✅ Tunnel URL: $TUNNEL_URL"
+            if grep -q "ssh session:" /tmp/tmate_output.log; then
+              SSH_STRING=$(grep "ssh session:" /tmp/tmate_output.log | head -1)
+              echo "SSH_STRING=$SSH_STRING" >> $GITHUB_OUTPUT
               break
             fi
-            sleep 3
+            sleep 2
           done
-          echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
+          cat /tmp/tmate_output.log
 
+      # ---------- Print instructions ----------
       - name: Print access
         env:
-          TUNNEL_URL: ${{ steps.tunnel.outputs.tunnel_url }}
+          SSH_STRING: ${{ steps.tmate.outputs.SSH_STRING }}
         run: |
           echo "================================================================="
-          echo "🌐 Hermes Agent Web Dashboard: $TUNNEL_URL"
+          echo "🔑 SSH into the runner using:"
+          echo "   $SSH_STRING"
           echo ""
-          echo "🔐 Username: admin"
-          echo "🔐 Password: ${{ env.ADMIN_PASSWORD }}"
+          echo "🌐 Once connected, forward the dashboard port to your local machine:"
+          echo "   ssh -L 18789:localhost:${{ env.HERMES_PORT }} ..."
           echo ""
-          echo "💡 Model is set to '${{ env.OLLAMA_MODEL }}'."
+          echo "🔐 Dashboard credentials:"
+          echo "   Username: admin"
+          echo "   Password: ${{ env.ADMIN_PASSWORD }}"
+          echo ""
+          echo "💡 Then open http://localhost:18789 in your browser."
           echo "================================================================="
           sleep infinity
