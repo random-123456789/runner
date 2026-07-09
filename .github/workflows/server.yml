@@ -43,11 +43,9 @@ jobs:
             -m ../model.gguf \
             -t 4 \
             -tb 4 \
-            -fa 1 \
+            -fa on \
             -ngl 0 \
-            -np 1 \      
-            --cpu-strict 1 \     
-            --cpu-range 0-3 \ 
+            -np 1 \ 
             &
           
           for i in {1..600}; do
