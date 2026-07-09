@@ -47,7 +47,7 @@ jobs:
             -ngl 0 \
             -c 4096 \
             --jinja \
-            --chat-template-kwargs '{ "enable_thinking": false }' \
+            --chat-template-kwargs '{ "enable_thinking": true }' \
             &
           
           for i in {1..600}; do
