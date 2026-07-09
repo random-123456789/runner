@@ -23,8 +23,9 @@ jobs:
 
       - name: Build llama-server with RPC support
         run: |
-          curl -L -o llama.tar.gz https://github.com/ggml-org/llama.cpp/releases/download/b9940/llama-b9940-bin-ubuntu-x64.tar.gz    
-          tar -xzf llama.tar.gz
+          wget https://github.com/ggml-org/llama.cpp/releases/download/b9940/llama-b9940-bin-ubuntu-x64.tar.gz    
+          tar -xzf llama-b9940-bin-ubuntu-x64.tar.gz
+          cd llama-b9940
           chmod +x llama-server
          
       - name: Download model
