@@ -38,7 +38,7 @@ jobs:
           sudo apt-get install -y nodejs npm
           sudo npm install -g holesail
 
-      # ---------- Configure Hermes ----------
+      # ---------- Configure Hermes provider ----------
       - name: Configure Hermes
         run: |
           mkdir -p ~/.hermes
@@ -49,7 +49,7 @@ jobs:
           echo "✅ Configuration:"
           hermes config show
 
-      # ---------- Configure authentication ----------
+      # ---------- Configure dashboard auth ----------
       - name: Configure authentication
         run: |
           PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
@@ -71,38 +71,32 @@ jobs:
             echo "✅ Ollama already running"
           fi
 
-      # ---------- Start Hermes API Server (foreground) ----------
-      - name: Start Hermes API Server
+      # ---------- Start Hermes Dashboard ----------
+      - name: Start Hermes Dashboard
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
           set -a; source ~/.hermes/.env; set +a
-          # Configure API server via env vars
-          export API_SERVER_ENABLED=true
-          export API_SERVER_HOST=0.0.0.0
-          export API_SERVER_PORT=${{ env.HERMES_PORT }}
-          export API_SERVER_KEY=$(openssl rand -base64 32)
-          echo "API Server Key: $API_SERVER_KEY"
-          # Run the server – this will stay alive
-          hermes serve > gateway.log 2>&1 &
-          SERVER_PID=$!
-          echo "Server PID: $SERVER_PID"
+          # Start the dashboard – this will serve both the UI and the API
+          hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open > dashboard.log 2>&1 &
+          DASHBOARD_PID=$!
+          echo "Dashboard PID: $DASHBOARD_PID"
           sleep 15
-          if ps -p $SERVER_PID > /dev/null; then
-            echo "✅ Server is running (PID: $SERVER_PID)"
+          if ps -p $DASHBOARD_PID > /dev/null; then
+            echo "✅ Dashboard is running (PID: $DASHBOARD_PID)"
           else
-            echo "❌ Server died. Logs:"
-            cat gateway.log
+            echo "❌ Dashboard died. Logs:"
+            cat dashboard.log
             exit 1
           fi
           if curl -s http://localhost:${{ env.HERMES_PORT }}/api/status > /dev/null; then
-            echo "✅ Server is responding"
+            echo "✅ Dashboard is responding"
           else
-            echo "❌ Server not responding. Logs:"
-            cat gateway.log
+            echo "❌ Dashboard not responding. Logs:"
+            cat dashboard.log
             exit 1
           fi
 
-      # ---------- Expose server via Holesail ----------
+      # ---------- Expose via Holesail ----------
       - name: Expose with Holesail
         id: holesail
         run: |
@@ -135,6 +129,6 @@ jobs:
           echo "   3. Open http://localhost:${{ env.HERMES_PORT }} in your browser"
           echo "   4. Log in with the credentials above."
           echo ""
-          echo "💡 The API server is now running and will respond to chat requests."
+          echo "💡 The dashboard is now running and should be able to chat."
           echo "================================================================="
           sleep infinity
