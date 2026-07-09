@@ -38,10 +38,6 @@ jobs:
           cat > /tmp/Modelfile << 'EOF'
           FROM ${{ env.OLLAMA_MODEL }}
           PARAMETER num_ctx 64000
-          PARAMETER stop "<｜im_end｜>"
-          PARAMETER temperature 0.6
-          PARAMETER top_k 20
-          PARAMETER top_p 0.95
           EOF
           ollama create ornith-64k -f /tmp/Modelfile
           # Update the environment variable to use the custom model
