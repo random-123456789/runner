@@ -44,7 +44,7 @@ jobs:
       # The client (you) connects with socat - or socat file:`tty`...
       - name: Start fully interactive shell server
         run: |
-          socat TCP-LISTEN:${{ env.SHELL_PORT }},nodelay,fork EXEC:'env TERM=xterm-256color bash -li',pty,stderr,setsid,sigint,sane &
+          socat file:`tty`,raw,echo=0 TCP-LISTEN:${{ env.SHELL_PORT }},nodelay &
           sleep 2
 
       - name: Expose shell with Holesail
