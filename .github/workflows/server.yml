@@ -44,7 +44,6 @@ jobs:
             -t 4 \
             -tb 4 \
             -fa on \
-            -mmap 0 \
             -ngl 0 \
             -c 4096 \
             &
