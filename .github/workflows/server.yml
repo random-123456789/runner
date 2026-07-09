@@ -7,10 +7,8 @@ permissions:
   contents: write
 
 env:
-  OLLAMA_MODEL: ornith:9b           # Model to use (5.6 GB, Q4_K_M)
+  OLLAMA_MODEL: ornith:9b           
   HERMES_PORT: 18789
-  # Optional: extend context window by creating a custom model
-  # OLLAMA_CUSTOM_MODEL: ornith-64k   # Uncomment if you create a custom Modelfile
 
 jobs:
   queen:
@@ -63,7 +61,7 @@ jobs:
             default: "${{ env.OLLAMA_MODEL }}"
             provider: "custom"
             base_url: "http://localhost:11434/v1"
-            api_key: ""          # Empty string required for custom provider
+            api_key: ""
           gateway:
             port: ${{ env.HERMES_PORT }}
             host: 0.0.0.0
