@@ -1,4 +1,4 @@
-name: Queen (Hermes Agent + Ollama + Holesail)
+name: Queen (Hermes Agent + Ollama + ornith:9b)
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ permissions:
   contents: write
 
 env:
-  OLLAMA_MODEL: granite4:tiny-h
+  OLLAMA_MODEL: ornith:9b              # Model optimized for agentic coding
   HERMES_PORT: 18789
 
 jobs:
@@ -22,7 +22,6 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl xz-utils nodejs npm
-          # xz-utils is required by the Hermes installer [reference:1]
 
       # ---------- Setup Ollama ----------
       - name: Setup Ollama
@@ -34,36 +33,31 @@ jobs:
       # ---------- Install Hermes Agent ----------
       - name: Install Hermes Agent
         run: |
-          # Official Hermes installer [reference:2]
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
 
       # ---------- Install Holesail ----------
       - name: Install Holesail
-        run: |
-          sudo npm install -g holesail
+        run: sudo npm install -g holesail
 
-      # ---------- Create Hermes config ----------
+      # ---------- Configure Hermes for Ollama ----------
       - name: Configure Hermes
         run: |
           mkdir -p ~/.hermes
           cat > ~/.hermes/config.yaml << EOF
           model:
-            provider: ollama
-            model: ${{ env.OLLAMA_MODEL }}
-            baseUrl: http://localhost:11434
+            default: "${{ env.OLLAMA_MODEL }}"
+            provider: "custom"
+            base_url: "http://localhost:11434/v1"
           gateway:
             port: ${{ env.HERMES_PORT }}
             host: 0.0.0.0
           EOF
-          # For local Ollama, the provider can be set to "Custom Endpoint" with
-          # base URL http://localhost:11434/v1 and no API key [reference:3]
 
       # ---------- Configure dashboard authentication ----------
       - name: Configure Hermes authentication
         run: |
-          # The dashboard requires auth when bound to non-loopback addresses [reference:4]
           PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
           SECRET=$(openssl rand -base64 32)
           cat > ~/.hermes/.env << EOF
@@ -77,7 +71,6 @@ jobs:
       - name: Install dashboard dependencies
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
-          # The dashboard needs FastAPI/Uvicorn and ptyprocess [reference:5]
           cd ~/.hermes/hermes-agent
           uv pip install -e ".[web,pty]" || pip install -e ".[web,pty]"
 
@@ -90,8 +83,6 @@ jobs:
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
           set -a; source ~/.hermes/.env; set +a
-          # --host 0.0.0.0 binds to all interfaces [reference:6]
-          # --no-open prevents browser from opening automatically [reference:7]
           hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open &
           sleep 15
           for i in {1..20}; do
@@ -107,8 +98,6 @@ jobs:
       - name: Expose Dashboard with Holesail
         id: holesail
         run: |
-          # Start Holesail server exposing port HERMES_PORT
-          # --public makes the key visible in logs for retrieval
           holesail --live ${{ env.HERMES_PORT }} --public > holesail.log 2>&1 &
           sleep 10
           CONNECTION_KEY=$(grep -oP 'hs://[a-zA-Z0-9]+' holesail.log | head -1)
@@ -143,6 +132,7 @@ jobs:
           echo "   Username: admin"
           echo "   Password: ${{ env.ADMIN_PASSWORD }}"
           echo ""
+          echo "💡 Model: ${{ env.OLLAMA_MODEL }} (5.6 GB, Q4_K_M)"
           echo "💡 The connection is direct P2P - no lag, no relay servers!"
           echo "================================================================="
           sleep infinity
