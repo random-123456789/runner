@@ -7,8 +7,10 @@ permissions:
   contents: write
 
 env:
-  OLLAMA_MODEL: ornith:9b
+  OLLAMA_MODEL: ornith:9b           # Model to use (5.6 GB, Q4_K_M)
   HERMES_PORT: 18789
+  # Optional: extend context window by creating a custom model
+  # OLLAMA_CUSTOM_MODEL: ornith-64k   # Uncomment if you create a custom Modelfile
 
 jobs:
   queen:
@@ -23,12 +25,29 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y curl xz-utils nodejs npm
 
-      # ---------- Setup Ollama ----------
+      # ---------- Setup Ollama (with version to avoid 412 error) ----------
       - name: Setup Ollama
         uses: ai-action/setup-ollama@v2
+        with:
+          version: 0.5.1        # Minimum version that supports ornith:9b
 
       - name: Pull Ollama model
         run: ollama pull ${{ env.OLLAMA_MODEL }}
+
+      # Optional: Create a custom model with larger context (64k) for Hermes
+      - name: Create custom model with extended context
+        run: |
+          cat > /tmp/Modelfile << 'EOF'
+          FROM ${{ env.OLLAMA_MODEL }}
+          PARAMETER num_ctx 64000
+          PARAMETER stop "<｜im_end｜>"
+          PARAMETER temperature 0.6
+          PARAMETER top_k 20
+          PARAMETER top_p 0.95
+          EOF
+          ollama create ornith-64k -f /tmp/Modelfile
+          # Update the environment variable to use the custom model
+          echo "OLLAMA_MODEL=ornith-64k" >> $GITHUB_ENV
 
       # ---------- Install Hermes Agent ----------
       - name: Install Hermes Agent
@@ -37,11 +56,11 @@ jobs:
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
 
-      # ---------- Install Holesail ----------
+      # ---------- Install Holesail (for low‑latency P2P tunnel) ----------
       - name: Install Holesail
         run: sudo npm install -g holesail
 
-      # ---------- Configure Hermes for Ollama (with API key) ----------
+      # ---------- Configure Hermes for Ollama (custom endpoint) ----------
       - name: Configure Hermes
         run: |
           mkdir -p ~/.hermes
@@ -50,7 +69,7 @@ jobs:
             default: "${{ env.OLLAMA_MODEL }}"
             provider: "custom"
             base_url: "http://localhost:11434/v1"
-            api_key: ""
+            api_key: ""          # Empty string required for custom provider
           gateway:
             port: ${{ env.HERMES_PORT }}
             host: 0.0.0.0
@@ -68,7 +87,7 @@ jobs:
           EOF
           echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
 
-      # ---------- Install web + pty extras for dashboard ----------
+      # ---------- Install web + pty extras for the dashboard ----------
       - name: Install dashboard dependencies
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
@@ -129,7 +148,7 @@ jobs:
           echo "   Username: admin"
           echo "   Password: ${{ env.ADMIN_PASSWORD }}"
           echo ""
-          echo "💡 Model: ${{ env.OLLAMA_MODEL }} (5.6 GB, Q4_K_M)"
-          echo "💡 API key is set to empty string (custom provider)."
+          echo "💡 Model: ${{ env.OLLAMA_MODEL }} (custom 64k context if you created it)"
+          echo "💡 The connection is direct P2P - no lag, no relay servers!"
           echo "================================================================="
           sleep infinity
