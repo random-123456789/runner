@@ -42,18 +42,12 @@ jobs:
       - name: Configure Hermes
         run: |
           mkdir -p ~/.hermes
-          # Configure Ollama provider
+          # Set Ollama provider
           hermes config set models.providers.ollama.baseUrl "http://localhost:11434"
           hermes config set models.providers.ollama.models '[{"id":"granite4:tiny-h","api":"ollama"}]'
           hermes config set agents.default.model "ollama/granite4:tiny-h"
           echo "✅ Configuration:"
           hermes config show
-
-      # ---------- Install Hermes Gateway ----------
-      - name: Install Hermes Gateway
-        run: |
-          export PATH="$HOME/.hermes/bin:$PATH"
-          hermes gateway install
 
       # ---------- Configure authentication ----------
       - name: Configure authentication
@@ -77,38 +71,38 @@ jobs:
             echo "✅ Ollama already running"
           fi
 
-      # ---------- Start Hermes Gateway (with environment variables) ----------
-      - name: Start Hermes Gateway
+      # ---------- Start Hermes API Server (foreground) ----------
+      - name: Start Hermes API Server
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
           set -a; source ~/.hermes/.env; set +a
-          # Use environment variables to configure the API server
+          # Configure API server via env vars
           export API_SERVER_ENABLED=true
           export API_SERVER_HOST=0.0.0.0
           export API_SERVER_PORT=${{ env.HERMES_PORT }}
           export API_SERVER_KEY=$(openssl rand -base64 32)
           echo "API Server Key: $API_SERVER_KEY"
-          # Start the gateway (it should now use the env vars)
-          hermes gateway start > gateway.log 2>&1 &
-          GATEWAY_PID=$!
-          echo "Gateway PID: $GATEWAY_PID"
+          # Run the server – this will stay alive
+          hermes serve > gateway.log 2>&1 &
+          SERVER_PID=$!
+          echo "Server PID: $SERVER_PID"
           sleep 15
-          if ps -p $GATEWAY_PID > /dev/null; then
-            echo "✅ Gateway is running (PID: $GATEWAY_PID)"
+          if ps -p $SERVER_PID > /dev/null; then
+            echo "✅ Server is running (PID: $SERVER_PID)"
           else
-            echo "❌ Gateway died. Logs:"
+            echo "❌ Server died. Logs:"
             cat gateway.log
             exit 1
           fi
           if curl -s http://localhost:${{ env.HERMES_PORT }}/api/status > /dev/null; then
-            echo "✅ Gateway is responding"
+            echo "✅ Server is responding"
           else
-            echo "❌ Gateway not responding. Logs:"
+            echo "❌ Server not responding. Logs:"
             cat gateway.log
             exit 1
           fi
 
-      # ---------- Expose Gateway via Holesail ----------
+      # ---------- Expose server via Holesail ----------
       - name: Expose with Holesail
         id: holesail
         run: |
@@ -141,6 +135,6 @@ jobs:
           echo "   3. Open http://localhost:${{ env.HERMES_PORT }} in your browser"
           echo "   4. Log in with the credentials above."
           echo ""
-          echo "💡 The gateway is now running and will respond to chat requests."
+          echo "💡 The API server is now running and will respond to chat requests."
           echo "================================================================="
           sleep infinity
