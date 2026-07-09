@@ -35,7 +35,7 @@ jobs:
          
       - name: Download model
         run: |
-          MODEL_URL="https://huggingface.co/deepreinforce-ai/Ornith-1.0-9B-GGUF/resolve/main/ornith-1.0-9b-Q4_K_M.gguf"
+          MODEL_URL="https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
           curl -L -o model.gguf "$MODEL_URL" -f --retry 3 --retry-delay 2
           if [ "$(head -c 4 model.gguf)" = "GGUF" ]; then
             echo "✅ Valid GGUF file downloaded"
