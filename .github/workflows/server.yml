@@ -45,11 +45,11 @@ jobs:
             -tb 4 \
             -fa on \
             -ngl 0 \
-            --cpu-strict 1 \
-            --cpu-range 0-3 \
             -ctk q4_0 \
             -ctv q4_0 \
-            -c 64000 \
+            --cpu-strict 1 \
+            --cpu-range 0-3 \
+            -c 70000 \
             &
           
           for i in {1..600}; do
