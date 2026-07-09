@@ -47,7 +47,7 @@ jobs:
             -ngl 0 \
             -c 4096 \
             --jinja \
-            --reasoning-format deepseek \
+            --chat-template-kwargs '{ "enable_thinking": false }' \
             &
           
           for i in {1..600}; do
