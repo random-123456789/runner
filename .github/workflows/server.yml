@@ -28,8 +28,6 @@ jobs:
       # ---------- Setup Ollama (with version to avoid 412 error) ----------
       - name: Setup Ollama
         uses: ai-action/setup-ollama@v2
-        with:
-          version: 0.5.1        # Minimum version that supports ornith:9b
 
       - name: Pull Ollama model
         run: ollama pull ${{ env.OLLAMA_MODEL }}
