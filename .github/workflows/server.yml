@@ -23,9 +23,9 @@ jobs:
 
       - name: Build llama-server with RPC support
         run: |
-          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/heads/master.zip
+          curl -Lo llama.cpp.zip https://github.com/ggml-org/llama.cpp/archive/refs/tags/b8487.zip
           unzip -q llama.cpp.zip
-          cd llama.cpp-master
+          cd llama.cpp-b8487
           mkdir build && cd build
           cmake .. -DGGML_NATIVE=ON -DGGML_CUDA=OFF -DGGML_METAL=OFF
           cmake --build . --config Release -j4 --target llama-server
