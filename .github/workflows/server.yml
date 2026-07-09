@@ -38,19 +38,31 @@ jobs:
           sudo apt-get install -y nodejs npm
           sudo npm install -g holesail
 
-      # ---------- Configure Hermes with Ollama ----------
+      # ---------- Create Hermes config ----------
       - name: Configure Hermes
         run: |
           mkdir -p ~/.hermes
-          # Configure Ollama as the provider
-          hermes config set models.providers.ollama.baseUrl "http://localhost:11434"
-          hermes config set models.providers.ollama.models '[{"id":"granite4:tiny-h","api":"ollama"}]'
-          hermes config set agents.default.model "ollama/granite4:tiny-h"
-          # Set up API authentication (IMPORTANT for security!)
+          cat > ~/.hermes/config.yaml << EOF
+          model:
+            provider: ollama
+            model: ${{ env.OLLAMA_MODEL }}
+            baseUrl: http://localhost:11434
+          gateway:
+            port: ${{ env.HERMES_PORT }}
+            host: 0.0.0.0
+          EOF
+
+      # ---------- Configure dashboard auth ----------
+      - name: Configure Hermes authentication
+        run: |
           PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
-          hermes config set api.auth.enabled true
-          hermes config set api.auth.secret "$PASSWORD"
-          echo "HERMES_PASSWORD=$PASSWORD" >> $GITHUB_ENV
+          SECRET=$(openssl rand -base64 32)
+          cat > ~/.hermes/.env << EOF
+          HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin
+          HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=$PASSWORD
+          HERMES_DASHBOARD_BASIC_AUTH_SECRET=$SECRET
+          EOF
+          echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
 
       # ---------- Start Ollama service ----------
       - name: Start Ollama
@@ -60,30 +72,35 @@ jobs:
       - name: Start Hermes Dashboard
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
-          # Bind to 0.0.0.0 so Holesail can forward
+          set -a; source ~/.hermes/.env; set +a
           hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open &
-          sleep 10
+          sleep 15
           for i in {1..20}; do
-            if curl -s http://localhost:${{ env.HERMES_PORT }}/health > /dev/null; then
-              echo "✅ Hermes Dashboard ready"
+            if curl -s http://localhost:${{ env.HERMES_PORT }}/api/status > /dev/null; then
+              echo "✅ Dashboard ready"
               break
             fi
+            echo "⏳ Waiting for dashboard... ($i/20)"
             sleep 2
           done
 
-      # ---------- Expose Hermes via Holesail ----------
-      - name: Expose Hermes with Holesail
+      # ---------- Expose Dashboard via Holesail ----------
+      - name: Expose Dashboard with Holesail
         id: holesail
         run: |
+          # Start Holesail server exposing port 18789
+          # The --public flag makes the key visible in logs
           holesail --live ${{ env.HERMES_PORT }} --public > holesail.log 2>&1 &
           sleep 10
+          # Extract the connection key from logs
           CONNECTION_KEY=$(grep -oP 'hs://[a-zA-Z0-9]+' holesail.log | head -1)
           if [ -z "$CONNECTION_KEY" ]; then
-            echo "❌ Failed to get Holesail key"
+            echo "❌ Failed to get Holesail connection key"
             cat holesail.log
             exit 1
           fi
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
+          echo "✅ Holesail key: $CONNECTION_KEY"
 
       # ---------- Print access instructions ----------
       - name: Print access
@@ -94,24 +111,20 @@ jobs:
           echo "🔑 Holesail Connection Key:"
           echo "   $CONNECTION_KEY"
           echo ""
-          echo "🔐 Hermes API Password: ${{ env.HERMES_PASSWORD }}"
-          echo ""
-          echo "🌐 To access the Hermes Dashboard from your browser:"
+          echo "🌐 To access the Hermes dashboard from your browser:"
           echo ""
           echo "   1. Install Holesail on your local machine:"
           echo "      npm install -g holesail"
           echo ""
-          echo "   2. Connect to the runner's Hermes port:"
+          echo "   2. Connect to the runner's Holesail server:"
           echo "      holesail \"$CONNECTION_KEY\" --port ${{ env.HERMES_PORT }}"
           echo ""
           echo "   3. Open http://localhost:${{ env.HERMES_PORT }} in your browser"
           echo ""
-          echo "   4. When prompted, enter:"
-          echo "      Password: ${{ env.HERMES_PASSWORD }}"
+          echo "🔐 Dashboard credentials:"
+          echo "   Username: admin"
+          echo "   Password: ${{ env.ADMIN_PASSWORD }}"
           echo ""
-          echo "💡 To use the Hermes CLI remotely, run:"
-          echo "   curl -H 'Authorization: Bearer ${{ env.HERMES_PASSWORD }}' http://localhost:${{ env.HERMES_PORT }}/api/chat"
-          echo ""
-          echo "🔒 Security: API authentication is enabled. Keep the password safe."
+          echo "💡 The connection is direct P2P - no lag, no relay servers!"
           echo "================================================================="
           sleep infinity
