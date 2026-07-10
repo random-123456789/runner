@@ -9,8 +9,6 @@ permissions:
 env:
   MODEL_URL: "https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
   HERMES_PORT: 18789
-  LLAMA_PORT: 8080
-  OLLAMA_MODEL: granite4:tiny-h   # Not actually used; kept for compatibility
 
 jobs:
   queen:
@@ -62,7 +60,7 @@ jobs:
           model:
             default: "granite"
             provider: "custom"
-            base_url: "http://localhost:${{ env.LLAMA_PORT }}/v1"
+            base_url: "http://localhost:8080/v1"
             api_key: ""
           gateway:
             port: ${{ env.HERMES_PORT }}
@@ -103,12 +101,10 @@ jobs:
             --cpu-strict 1 \
             --cpu-range 0-3 \
             -c 70000 \
-            --host 0.0.0.0 \
-            --port ${{ env.LLAMA_PORT }} \
             > ../llama.log 2>&1 &
           cd ..
           for i in {1..30}; do
-            if curl -s http://localhost:${{ env.LLAMA_PORT }}/health > /dev/null; then
+            if curl -s http://localhost:8080/health > /dev/null; then
               echo "✅ llama-server ready"
               break
             fi
