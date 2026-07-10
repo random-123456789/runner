@@ -35,7 +35,7 @@ jobs:
           echo "🌐 Starting llama-server"
           cd llama-b9940
           chmod +x llama-server
-          ./llama-server \
+          nohup ./llama-server \
             -m ../model.gguf \
             -t 4 \
             -tb 4 \
