@@ -1,4 +1,4 @@
-name: Queen (llama.cpp + Hermes Agent + Holesail)
+name: Queen (Hermes Agent + llama.cpp + Holesail)
 
 on:
   workflow_dispatch:
@@ -10,7 +10,6 @@ env:
   MODEL_URL: "https://huggingface.co/glogwa68/granite-4.0-h-tiny-DISTILL-OPUS-4.5-think-GGUF/resolve/main/granite-4.0-h-tiny-DISTILL-4.5-opus-high-think-q4_k_m.gguf"
   HERMES_PORT: 18789
   LLAMA_PORT: 8080
-  MODEL_NAME: "granite-4.0-h-tiny"   # Used in Hermes config
 
 jobs:
   queen:
@@ -19,50 +18,58 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ---------- Install system dependencies ----------
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y curl xz-utils nodejs npm jq
 
+      # ---------- Download llama.cpp ----------
       - name: Download llama.cpp
         run: |
           wget -q https://github.com/ggml-org/llama.cpp/releases/download/b9940/llama-b9940-bin-ubuntu-x64.tar.gz
           tar -xzf llama-b9940-bin-ubuntu-x64.tar.gz
           chmod +x llama-b9940/llama-server
 
+      # ---------- Download model ----------
       - name: Download model
         run: |
           curl -L -o model.gguf "${{ env.MODEL_URL }}" -f --retry 3 --retry-delay 2
-          if [ "$(head -c 4 model.gguf)" = "GGUF" ]; then echo "✅ Valid GGUF file"; else exit 1; fi
+          if [ "$(head -c 4 model.gguf)" = "GGUF" ]; then
+            echo "✅ Valid GGUF file"
+          else
+            echo "❌ Invalid GGUF file"
+            exit 1
+          fi
 
+      # ---------- Install Hermes Agent ----------
       - name: Install Hermes Agent
         run: |
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           echo "$HOME/.hermes/bin" >> $GITHUB_PATH
           export PATH="$HOME/.hermes/bin:$PATH"
 
+      # ---------- Install Holesail ----------
       - name: Install Holesail
         run: sudo npm install -g holesail
 
-      - name: Configure Hermes (llama.cpp provider)
+      # ---------- Configure Hermes for llama.cpp ----------
+      - name: Configure Hermes
         run: |
           mkdir -p ~/.hermes
-          cat > ~/.hermes/config.yaml << EOF
+          cat > ~/.hermes/config.yaml << 'EOF'
           model:
-            provider: custom
-            default: ${{ env.MODEL_NAME }}
-            base_url: http://localhost:${{ env.LLAMA_PORT }}/v1
-            api_key: llama.cpp
+            default: "granite"
+            provider: "custom"
+            base_url: "http://localhost:8080/v1"
             api_mode: chat_completions
-          auxiliary:
-            session_search:
-              base_url: http://localhost:${{ env.LLAMA_PORT }}/v1
-              api_mode: embeddings
+            context_length: 65536
           gateway:
-            port: ${{ env.HERMES_PORT }}
+            port: 18789
             host: 0.0.0.0
           EOF
 
+      # ---------- Configure Hermes authentication ----------
       - name: Configure Hermes authentication
         run: |
           PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
@@ -74,26 +81,25 @@ jobs:
           EOF
           echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
 
+      # ---------- Install dashboard dependencies ----------
       - name: Install dashboard dependencies
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
           cd ~/.hermes/hermes-agent
           uv pip install -e ".[web,pty]" || pip install -e ".[web,pty]"
 
+      # ---------- Start llama-server (with --jinja and proper context) ----------
       - name: Start llama-server
         run: |
           cd llama-b9940
           nohup ./llama-server \
             -m ../model.gguf \
+            --jinja \
+            -fa \
+            -c 65536 \
             -t 4 \
             -tb 4 \
-            -fa on \
             -ngl 0 \
-            -ctk q4_0 \
-            -ctv q4_0 \
-            --cpu-strict 1 \
-            --cpu-range 0-3 \
-            -c 70000 \
             --host 0.0.0.0 \
             --port ${{ env.LLAMA_PORT }} \
             > ../llama.log 2>&1 &
@@ -105,7 +111,11 @@ jobs:
             fi
             sleep 2
           done
+          # Verify chat_template is present (--jinja working)
+          echo "🔍 Checking chat_template..."
+          curl -s http://localhost:${{ env.LLAMA_PORT }}/props | jq '.chat_template' || echo "⚠️ chat_template empty"
 
+      # ---------- Start Hermes Dashboard ----------
       - name: Start Hermes Dashboard
         run: |
           export PATH="$HOME/.hermes/bin:$PATH"
@@ -120,26 +130,36 @@ jobs:
             sleep 2
           done
 
+      # ---------- Expose Dashboard via Holesail ----------
       - name: Expose Dashboard with Holesail
         id: holesail
         run: |
           holesail --live ${{ env.HERMES_PORT }} --public > holesail.log 2>&1 &
           sleep 10
           CONNECTION_KEY=$(grep -oP 'hs://[a-zA-Z0-9]+' holesail.log | head -1)
+          if [ -z "$CONNECTION_KEY" ]; then
+            echo "❌ Failed to get Holesail key"
+            cat holesail.log
+            exit 1
+          fi
           echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
 
+      # ---------- Print access instructions ----------
       - name: Print access
         env:
           CONNECTION_KEY: ${{ steps.holesail.outputs.connection_key }}
         run: |
           echo "================================================================="
-          echo "🔑 Holesail Key: $CONNECTION_KEY"
-          echo "🌐 Connect: holesail \"$CONNECTION_KEY\" --port ${{ env.HERMES_PORT }}"
-          echo "🔐 Username: admin | Password: ${{ env.ADMIN_PASSWORD }}"
-          echo "⚡ llama.cpp serving model '${{ env.MODEL_NAME }}' at http://localhost:${{ env.LLAMA_PORT }}/v1"
-          echo "💡 Hermes Agent is configured with:"
-          echo "   - provider: custom"
-          echo "   - api_key: llama.cpp"
-          echo "   - api_mode: chat_completions"
+          echo "🔑 Holesail Connection Key: $CONNECTION_KEY"
+          echo ""
+          echo "🌐 To access the Hermes dashboard:"
+          echo "   1. Install Holesail: npm install -g holesail"
+          echo "   2. Connect: holesail \"$CONNECTION_KEY\" --port ${{ env.HERMES_PORT }}"
+          echo "   3. Open: http://localhost:${{ env.HERMES_PORT }}"
+          echo ""
+          echo "🔐 Login: admin | Password: ${{ env.ADMIN_PASSWORD }}"
+          echo ""
+          echo "⚡ llama.cpp is serving the model at http://localhost:${{ env.LLAMA_PORT }}/v1"
+          echo "   --jinja: enabled | -c: 65536 | -fa: enabled"
           echo "================================================================="
           sleep infinity
