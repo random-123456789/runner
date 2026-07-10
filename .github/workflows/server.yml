@@ -28,16 +28,27 @@ jobs:
       - name: Setup Ollama
         uses: ai-action/setup-ollama@v1
 
-      - name: Start Ollama with CPU affinity and real‑time priority (using sudo)
+      - name: Start Ollama with CPU affinity (no sudo)
         run: |
-          # Remove any previous ollama process
-          sudo pkill -f ollama || true
+          # Kill any existing ollama process
+          pkill -f ollama || true
           sleep 2
-          # Start ollama with CPU pinning and real‑time scheduling
-          sudo -E taskset -c 0-3 chrt -r 99 ollama serve &
-          sleep 5
-          # Verify it's running
-          pgrep -f "ollama serve" || echo "⚠️ Ollama not running, but continuing"
+          # Start ollama pinned to cores 0-3 with all env vars
+          taskset -c 0-3 ollama serve &
+          # Wait for it to be ready
+          for i in {1..15}; do
+            if curl -s http://127.0.0.1:11434/api/tags > /dev/null; then
+              echo "✅ Ollama server ready"
+              break
+            fi
+            echo "⏳ Waiting for Ollama... ($i/15)"
+            sleep 2
+          done
+          # If not ready, exit
+          if ! curl -s http://127.0.0.1:11434/api/tags > /dev/null; then
+            echo "❌ Ollama server failed to start"
+            exit 1
+          fi
 
       - name: Pull model
         run: ollama pull ${{ env.OLLAMA_MODEL }}
@@ -114,6 +125,6 @@ jobs:
           echo "================================================================="
           echo "🔑 Holesail Key: $CONNECTION_KEY"
           echo "🔐 Username: admin | Password: ${{ env.ADMIN_PASSWORD }}"
-          echo "⚡ Optimizations applied: CPU affinity, real‑time priority, custom runner args."
+          echo "⚡ Ollama optimized: taskset -c 0-3, OLLAMA_LLAMA_CPP_ARGS applied."
           echo "================================================================="
           sleep infinity
