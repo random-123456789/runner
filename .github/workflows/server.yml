@@ -30,12 +30,10 @@ jobs:
           make dllama
           make dllama-api
 
-      - name: Download model (Qwen 3 1.7B Q40 – 2.2 GB)
+      - name: Download model (only on root)
         run: |
           cd distributed-llama
-          # Answer 'n' to skip interactive prompt
           echo "n" | python3 launch.py ${{ env.MODEL_NAME }}
-          # Verify files exist
           if [ -f models/${{ env.MODEL_NAME }}/dllama_model_${{ env.MODEL_NAME }}.m ] && \
              [ -f models/${{ env.MODEL_NAME }}/dllama_tokenizer_${{ env.MODEL_NAME }}.t ]; then
             echo "✅ Model files downloaded"
@@ -72,6 +70,7 @@ jobs:
       - name: Start root node
         run: |
           cd distributed-llama
+          # Root listens on all interfaces
           ./dllama root \
             --port ${{ env.ROOT_PORT }} \
             --nthreads 4 \
@@ -86,10 +85,16 @@ jobs:
       - name: Start API server
         run: |
           cd distributed-llama
+          # Workers connect to root via Holesail, but the root's --workers
+          # needs to know worker addresses. Since workers connect to root,
+          # we point to localhost:ROOT_PORT
           ./dllama-api \
             --port ${{ env.API_PORT }} \
             --model models/${{ env.MODEL_NAME }}/dllama_model_${{ env.MODEL_NAME }}.m \
             --tokenizer models/${{ env.MODEL_NAME }}/dllama_tokenizer_${{ env.MODEL_NAME }}.t \
+            --buffer-float-type q80 \
+            --nthreads 4 \
+            --max-seq-len 4096 \
             --workers 127.0.0.1:${{ env.ROOT_PORT }} \
             > api.log 2>&1 &
           sleep 10
@@ -143,23 +148,11 @@ jobs:
           sudo apt-get install -y curl build-essential cmake git python3 python3-pip
           sudo npm install -g holesail
 
-      - name: Clone and build distributed-llama
+      - name: Clone and build distributed-llama (only binary, no model)
         run: |
           git clone https://github.com/b4rtaz/distributed-llama.git
           cd distributed-llama
           make dllama
-
-      - name: Download model (same as queen)
-        run: |
-          cd distributed-llama
-          echo "n" | python3 launch.py ${{ env.MODEL_NAME }}
-          if [ -f models/${{ env.MODEL_NAME }}/dllama_model_${{ env.MODEL_NAME }}.m ] && \
-             [ -f models/${{ env.MODEL_NAME }}/dllama_tokenizer_${{ env.MODEL_NAME }}.t ]; then
-            echo "✅ Model files downloaded"
-          else
-            echo "❌ Model files missing"
-            exit 1
-          fi
 
       - name: Fetch Holesail key from repository
         env:
@@ -167,6 +160,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           echo "📡 Fetching Holesail key..."
+          KEY=""
           for attempt in {1..60}; do
             RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -175,24 +169,24 @@ jobs:
               KEY=$(echo "$RESPONSE" | jq -r '.content' | base64 -d | tr -d '\n\r')
               if [ -n "$KEY" ]; then
                 echo "Fetched key: $KEY"
-                echo "CONNECTION_KEY=$KEY" >> $GITHUB_ENV
                 break
               fi
             fi
             echo "Waiting for key... ($attempt/60)"
             sleep 5
           done
-          if [ -z "$CONNECTION_KEY" ]; then
+          if [ -z "$KEY" ]; then
             echo "❌ Failed to fetch Holesail key"
             exit 1
           fi
+          echo "CONNECTION_KEY=$KEY" >> $GITHUB_ENV
 
       - name: Connect to queen via Holesail
         run: |
           holesail --connect "$CONNECTION_KEY" --port ${{ env.ROOT_PORT }} &
           sleep 10
 
-      - name: Start worker
+      - name: Start worker (no model needed)
         run: |
           cd distributed-llama
           ./dllama worker \
