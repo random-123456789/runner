@@ -37,7 +37,7 @@ jobs:
           cd llama-b9945-bin-ubuntu-x64
           nohup ./llama-server \
             -m ../model.gguf \
-            -t 4 -tb 4 -fa -np 1 -c 4096 \
+            -t 4 -tb 4 -fa -ngl 0 -c 4096 \
             --no-mmap --cpu-strict 1 --cpu-range 0-3 \
             --host 127.0.0.1 --port 8080 \
             > server.log 2>&1 &
