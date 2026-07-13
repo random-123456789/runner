@@ -42,7 +42,6 @@ jobs:
           FROM ibm/granite4:tiny-h
           # CPU optimizations for 4 vCPUs
           PARAMETER num_thread 4
-          PARAMETER num_thread_batch 4
           PARAMETER num_gpu 0
           # Context window for RAG / long documents
           PARAMETER num_ctx 64000
