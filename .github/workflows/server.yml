@@ -12,7 +12,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl jq build-essential cmake git wget python3-pip
+          sudo apt-get install -y curl jq git wget python3-pip
           pip3 install --upgrade pip
           sudo npm install -g holesail
 
