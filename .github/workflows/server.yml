@@ -20,8 +20,6 @@ jobs:
         run: |
           wget https://github.com/ggml-org/llama.cpp/releases/download/b9945/llama-b9945-bin-ubuntu-x64.tar.gz
           tar -xzf llama-b9945-bin-ubuntu-x64.tar.gz
-          cd llama-b9945-bin-ubuntu-x64
-          chmod +x llama-server
 
       - name: Download model (Qwen2.5-7B Q4_K_M)
         run: |
