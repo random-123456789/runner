@@ -1,127 +1,99 @@
-name: Queen (Ollama + Hermes + Holesail - Accelerated)
+name: Hermes + Web Dashboard + Holesail
 
 on:
   workflow_dispatch:
 
-env:
-  OLLAMA_MODEL: granite4:tiny-h
-  OLLAMA_FLASH_ATTENTION: 1
-  OLLAMA_NUM_THREADS: 4
-  OLLAMA_KV_CACHE_TYPE: q8_0
-  OLLAMA_CONTEXT_LENGTH: 70000
-  HERMES_PORT: 18789
-
 jobs:
-  queen:
+  agent-runner:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Install system dependencies
+    steps:
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl xz-utils nodejs npm util-linux
+          sudo apt-get install -y curl jq build-essential cmake git wget python3-pip
+          pip3 install --upgrade pip
+          sudo npm install -g holesail
 
-      - name: Setup Ollama
-        uses: ai-action/setup-ollama@v1
-
-      - name: Start Ollama with CPU affinity (no sudo)
+      - name: Download llama.cpp
         run: |
-          ollama serve &
-          # Wait for it to be ready
-          for i in {1..15}; do
-            if curl -s http://127.0.0.1:11434/api/tags > /dev/null; then
-              echo "✅ Ollama server ready"
-              break
-            fi
-            echo "⏳ Waiting for Ollama... ($i/15)"
-            sleep 2
-          done
-          # If not ready, exit
-          if ! curl -s http://127.0.0.1:11434/api/tags > /dev/null; then
-            echo "❌ Ollama server failed to start"
+          wget https://github.com/ggml-org/llama.cpp/releases/download/b9945/llama-b9945-bin-ubuntu-x64.tar.gz
+          tar -xzf llama-b9945-bin-ubuntu-x64.tar.gz
+          cd llama-b9945-bin-ubuntu-x64
+          chmod +x llama-server
+
+      - name: Download model (Qwen2.5-7B Q4_K_M)
+        run: |
+          MODEL_URL="https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf"
+          curl -L -o model.gguf "$MODEL_URL" -f --retry 3
+          if [ "$(head -c 4 model.gguf)" != "GGUF" ]; then
+            echo "❌ Invalid GGUF"
             exit 1
           fi
 
-      - name: Pull model
-        run: ollama pull ${{ env.OLLAMA_MODEL }}
+      - name: Start llama-server
+        run: |
+          cd llama-b9945-bin-ubuntu-x64
+          nohup ./llama-server \
+            -m ../model.gguf \
+            -t 4 -tb 4 -fa -np 1 -c 4096 \
+            --no-mmap --cpu-strict 1 --cpu-range 0-3 \
+            --host 127.0.0.1 --port 8080 \
+            > server.log 2>&1 &
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:8080/health > /dev/null; then
+              echo "✅ llama-server ready"
+              break
+            fi
+            sleep 2
+          done
 
       - name: Install Hermes Agent
         run: |
-          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-          echo "$HOME/.hermes/bin" >> $GITHUB_PATH
-          export PATH="$HOME/.hermes/bin:$PATH"
+          pip3 install hermes-agent
 
-      - name: Install Holesail
-        run: sudo npm install -g holesail
-
-    # ---------- Configure Hermes for Ollama (with API key) ----------
       - name: Configure Hermes
         run: |
           mkdir -p ~/.hermes
-          cat > ~/.hermes/config.yaml << EOF
+          cat > ~/.hermes/config.yaml << 'EOF'
           model:
-            default: "${{ env.OLLAMA_MODEL }}"
+            default: "local-model"
             provider: "custom"
-            base_url: "http://localhost:11434/v1"
-            api_key: "sk-no-key-required"
-          gateway:
-            port: ${{ env.HERMES_PORT }}
-            host: 0.0.0.0
+            base_url: "http://127.0.0.1:8080/v1"
+            api_key: "sk-no-api-key"
+          skills:
+            enabled:
+              - terminal
+              - file_editor
+              - web_browser
           EOF
 
-      - name: Configure Hermes authentication
+      - name: Install Hermes web dependencies and start dashboard
         run: |
-          PASSWORD=$(openssl rand -base64 12 | tr -d '/+=' | head -c 16)
-          SECRET=$(openssl rand -base64 32)
-          cat > ~/.hermes/.env << EOF
-          HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin
-          HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=$PASSWORD
-          HERMES_DASHBOARD_BASIC_AUTH_SECRET=$SECRET
-          EOF
-          echo "ADMIN_PASSWORD=$PASSWORD" >> $GITHUB_ENV
-
-      - name: Install dashboard dependencies
-        run: |
-          export PATH="$HOME/.hermes/bin:$PATH"
+          # Install web + pty extras
           cd ~/.hermes/hermes-agent
-          uv pip install -e ".[web,pty]" || pip install -e ".[web,pty]"
+          uv pip install -e ".[web,pty]" || pip3 install fastapi uvicorn ptyprocess
+          # Start the dashboard
+          nohup hermes dashboard --host 0.0.0.0 --port 9119 > dashboard.log 2>&1 &
+          sleep 3
 
-      - name: Start Hermes Dashboard
+      - name: Expose via Holesail (llama API + dashboard)
         run: |
-          export PATH="$HOME/.hermes/bin:$PATH"
-          set -a; source ~/.hermes/.env; set +a
-          hermes dashboard --host 0.0.0.0 --port ${{ env.HERMES_PORT }} --no-open &
-          sleep 15
-          for i in {1..20}; do
-            if curl -s http://localhost:${{ env.HERMES_PORT }}/api/status > /dev/null; then
-              echo "✅ Dashboard ready"
-              break
-            fi
-            sleep 2
-          done
+          # Expose llama.cpp API (port 8080)
+          holesail --live 8080 > /tmp/holesail_llama.txt 2>&1 &
+          sleep 2
+          LLAMA_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_llama.txt | head -1)
 
-      - name: Expose Dashboard with Holesail
-        id: holesail
-        run: |
-          holesail --live ${{ env.HERMES_PORT }} --public > holesail.log 2>&1 &
-          sleep 10
-          CONNECTION_KEY=$(grep -oP 'hs://[a-zA-Z0-9]+' holesail.log | head -1)
-          if [ -z "$CONNECTION_KEY" ]; then
-            echo "❌ Failed to get Holesail connection key"
-            cat holesail.log
-            exit 1
-          fi
-          echo "connection_key=$CONNECTION_KEY" >> $GITHUB_OUTPUT
+          # Expose Hermes dashboard (port 9119)
+          holesail --live 9119 > /tmp/holesail_dashboard.txt 2>&1 &
+          sleep 2
+          DASHBOARD_URL=$(grep -oE 'hs://[a-zA-Z0-9]+' /tmp/holesail_dashboard.txt | head -1)
 
-      - name: Print access
-        env:
-          CONNECTION_KEY: ${{ steps.holesail.outputs.connection_key }}
-        run: |
-          echo "================================================================="
-          echo "🔑 Holesail Key: $CONNECTION_KEY"
-          echo "🔐 Username: admin | Password: ${{ env.ADMIN_PASSWORD }}"
-          echo "⚡ Ollama optimized: taskset -c 0-3, OLLAMA_LLAMA_CPP_ARGS applied."
-          echo "================================================================="
-          sleep infinity
+          echo "✅ llama.cpp API: $LLAMA_URL"
+          echo "✅ Hermes Dashboard: $DASHBOARD_URL"
+          echo "::notice::llama API: $LLAMA_URL"
+          echo "::notice::Hermes Dashboard: $DASHBOARD_URL"
+
+      - name: Keep alive
+        run: tail -f /dev/null
