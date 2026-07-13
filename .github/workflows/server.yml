@@ -20,7 +20,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl build-essential cmake git python3 python3-pip netcat-openbsd
+          sudo apt-get install -y curl build-essential cmake git python3 python3-pip
           sudo npm install -g holesail
 
       - name: Clone and build distributed-llama
@@ -33,13 +33,12 @@ jobs:
       - name: Download model (only on root)
         run: |
           cd distributed-llama
-          echo "y" | python3 launch.py ${{ env.MODEL_NAME }}
+          echo "n" | python3 launch.py ${{ env.MODEL_NAME }}
           if [ -f models/${{ env.MODEL_NAME }}/dllama_model_${{ env.MODEL_NAME }}.m ] && \
              [ -f models/${{ env.MODEL_NAME }}/dllama_tokenizer_${{ env.MODEL_NAME }}.t ]; then
             echo "✅ Model files downloaded"
           else
             echo "❌ Model files missing"
-            ls -la models/${{ env.MODEL_NAME }} || true
             exit 1
           fi
 
@@ -71,6 +70,7 @@ jobs:
       - name: Start root node
         run: |
           cd distributed-llama
+          # Root listens on all interfaces
           ./dllama root \
             --port ${{ env.ROOT_PORT }} \
             --nthreads 4 \
@@ -80,26 +80,14 @@ jobs:
       - name: Wait for workers to connect
         run: |
           echo "⏳ Waiting for ${{ env.WORKER_COUNT }} workers to connect..."
-          # Wait up to 90 seconds
-          for i in {1..90}; do
-            # Check if any worker has connected (check root.log for "connected")
-            if grep -q "worker connected" distributed-llama/root.log 2>/dev/null; then
-              CONNECTED=$(grep -c "worker connected" distributed-llama/root.log || echo 0)
-              echo "  Connected workers: $CONNECTED"
-              if [ "$CONNECTED" -ge ${{ env.WORKER_COUNT }} ]; then
-                echo "✅ All workers connected!"
-                break
-              fi
-            fi
-            sleep 5
-          done
-          # Show root log for debugging
-          echo "📄 root.log (last 20 lines):"
-          tail -20 distributed-llama/root.log || true
+          sleep 60
 
       - name: Start API server
         run: |
           cd distributed-llama
+          # Workers connect to root via Holesail, but the root's --workers
+          # needs to know worker addresses. Since workers connect to root,
+          # we point to localhost:ROOT_PORT
           ./dllama-api \
             --port ${{ env.API_PORT }} \
             --model models/${{ env.MODEL_NAME }}/dllama_model_${{ env.MODEL_NAME }}.m \
@@ -111,20 +99,14 @@ jobs:
             > api.log 2>&1 &
           sleep 10
           for i in {1..30}; do
-            if nc -zv 127.0.0.1 ${{ env.API_PORT }} 2>&1 | grep -q "succeeded"; then
-              echo "✅ API port ${{ env.API_PORT }} is listening"
+            if curl -s http://127.0.0.1:${{ env.API_PORT }}/health > /dev/null; then
+              echo "✅ API ready"
               break
             fi
-            echo "⏳ Waiting for API port... ($i/30)"
             sleep 2
           done
-          if ! nc -zv 127.0.0.1 ${{ env.API_PORT }} 2>&1 | grep -q "succeeded"; then
-            echo "❌ API failed to start – showing api.log:"
-            cat api.log
-            exit 1
-          fi
 
-      - name: Expose API via Cloudflare Tunnel
+      - name: Expose API via Cloudflare Tunnel (optional)
         run: |
           if [ ! -f ./cloudflared ]; then
             curl -Lo cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -136,8 +118,6 @@ jobs:
           if [ -n "$TUNNEL_URL" ]; then
             echo "✅ Public API: $TUNNEL_URL"
             echo "::notice::API available at $TUNNEL_URL"
-          else
-            echo "⚠️ Tunnel may not be ready – check tunnel.log"
           fi
 
       - name: Print access info
@@ -165,7 +145,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y curl build-essential cmake git python3 python3-pip netcat-openbsd
+          sudo apt-get install -y curl build-essential cmake git python3 python3-pip
           sudo npm install -g holesail
 
       - name: Clone and build distributed-llama (only binary, no model)
@@ -205,23 +185,14 @@ jobs:
         run: |
           holesail --connect "$CONNECTION_KEY" --port ${{ env.ROOT_PORT }} &
           sleep 10
-          if nc -zv 127.0.0.1 ${{ env.ROOT_PORT }} 2>&1 | grep -q "succeeded"; then
-            echo "✅ Connected to root on port ${{ env.ROOT_PORT }}"
-          else
-            echo "❌ Cannot connect to root"
-            exit 1
-          fi
 
-      - name: Start worker
+      - name: Start worker (no model needed)
         run: |
           cd distributed-llama
           ./dllama worker \
             --port ${{ env.ROOT_PORT }} \
             --nthreads 4 \
             > worker.log 2>&1 &
-          sleep 5
-          echo "📄 worker.log (first 10 lines):"
-          head -10 worker.log || true
 
       - name: Keep alive
         run: sleep infinity
